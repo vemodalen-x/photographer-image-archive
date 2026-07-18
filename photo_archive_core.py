@@ -54,8 +54,41 @@ BROWSER_RENDER_TIMEOUT_SECONDS = 28
 BROWSER_VIRTUAL_TIME_BUDGET_MS = 10_000
 MAX_RENDERED_DOM_CHARS = 16 * 1024 * 1024
 MAX_IMAGE_DOWNLOAD_BYTES = 512 * 1024 * 1024
+MAX_WEBSITE_HTML_BYTES = 8 * 1024 * 1024
+MAX_ROBOTS_BYTES = 1024 * 1024
+MAX_SITEMAP_BYTES = 8 * 1024 * 1024
+MAX_QUEUED_PAGES = 512
+MAX_PAGE_LINKS = 4096
+MAX_PAGE_CANDIDATES = 4096
 
 ProgressCallback = Callable[[str, dict], None]
+
+
+def _bounded_response_content(response, max_bytes: int, label: str) -> bytes:
+    declared_size = _safe_int(response.headers.get("Content-Length"))
+    if declared_size > max_bytes:
+        raise PhotoArchiveError(f"{label} exceeds the {max_bytes // (1024 * 1024)} MiB response limit")
+
+    iter_content = getattr(response, "iter_content", None)
+    if callable(iter_content):
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in iter_content(chunk_size=256 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise PhotoArchiveError(f"{label} exceeds the {max_bytes // (1024 * 1024)} MiB response limit")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    content = getattr(response, "content", None)
+    if content is None or (not content and getattr(response, "text", "")):
+        text = str(getattr(response, "text", ""))
+        content = text.encode(getattr(response, "encoding", None) or "utf-8", errors="replace")
+    if len(content) > max_bytes:
+        raise PhotoArchiveError(f"{label} exceeds the {max_bytes // (1024 * 1024)} MiB response limit")
+    return bytes(content)
 
 
 class PhotoArchiveError(Exception):
@@ -819,6 +852,8 @@ class WebsiteImageSource:
             normalized = _canonical_page_url(url)
             if not normalized or normalized in visited_pages or normalized in queued_urls:
                 return
+            if len(queued_urls) >= MAX_QUEUED_PAGES:
+                return
             parsed = urlparse(normalized)
             if not _same_site_host(parsed.netloc, start_host) or not _is_probable_html_page(normalized):
                 return
@@ -863,7 +898,7 @@ class WebsiteImageSource:
                 target=limit,
             )
             try:
-                text = self._fetch_html(page_url)
+                text = self._fetch_html(page_url, start_host)
             except Exception as exc:
                 page_errors += 1
                 _emit(callback, "source_error", source=self.source_name, message=f"{page_url}: {exc}")
@@ -1056,9 +1091,14 @@ class WebsiteImageSource:
         _emit(callback, "source_index", message=f"Reading site policy: {robots_url}")
         _check_cancel(cancel_event)
         try:
-            response = self.session.get(robots_url, timeout=(4, 7))
-            response.raise_for_status()
-            lines = response.text.splitlines()
+            response, content = self._bounded_get(
+                robots_url,
+                timeout=(4, 7),
+                max_bytes=MAX_ROBOTS_BYTES,
+                expected_host=parsed.netloc.lower(),
+                label="robots.txt",
+            )
+            lines = content.decode(getattr(response, "encoding", None) or "utf-8", errors="replace").splitlines()
             parser.parse(lines)
             for line in lines:
                 key, separator, value = line.partition(":")
@@ -1087,9 +1127,14 @@ class WebsiteImageSource:
             visited.add(sitemap_url)
             _emit(callback, "source_index", message=f"Reading sitemap: {sitemap_url}")
             try:
-                response = self.session.get(sitemap_url, timeout=(5, 10))
-                response.raise_for_status()
-                root = ET.fromstring(response.content)
+                _response, content = self._bounded_get(
+                    sitemap_url,
+                    timeout=(5, 10),
+                    max_bytes=MAX_SITEMAP_BYTES,
+                    expected_host=start_host,
+                    label="sitemap",
+                )
+                root = ET.fromstring(content)
             except Exception as exc:
                 _emit(callback, "source_notice", message=f"Skipped sitemap {sitemap_url}: {exc}")
                 continue
@@ -1102,17 +1147,49 @@ class WebsiteImageSource:
             _emit(callback, "source_index", message=f"Sitemap supplied {len(pages)} candidate pages")
         return pages
 
-    def _fetch_html(self, url: str) -> str:
-        response = self.session.get(url, timeout=(8, 25))
-        response.raise_for_status()
+    def _bounded_get(
+        self,
+        url: str,
+        *,
+        timeout: tuple[int, int],
+        max_bytes: int,
+        expected_host: str,
+        label: str,
+    ):
+        try:
+            response = self.session.get(url, timeout=timeout, stream=True)
+        except TypeError as exc:
+            if "stream" not in str(exc):
+                raise
+            response = self.session.get(url, timeout=timeout)
+        try:
+            response.raise_for_status()
+            final_url = str(getattr(response, "url", "") or url)
+            if not _same_site_host(urlparse(final_url).netloc, expected_host):
+                raise PhotoArchiveError(f"{label} redirected outside the official site: {final_url}")
+            content = _bounded_response_content(response, max_bytes, label)
+            return response, content
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+
+    def _fetch_html(self, url: str, start_host: str = "") -> str:
+        start_host = start_host or urlparse(url).netloc.lower()
+        response, content = self._bounded_get(
+            url,
+            timeout=(8, 25),
+            max_bytes=MAX_WEBSITE_HTML_BYTES,
+            expected_host=start_host,
+            label="HTML page",
+        )
         content_type = response.headers.get("Content-Type", "").lower()
         if content_type and "html" not in content_type:
             raise PhotoArchiveError(f"not an HTML page: {content_type}")
-        if "charset=" not in content_type:
-            response.encoding = getattr(response, "apparent_encoding", None) or "utf-8"
-        elif not response.encoding:
-            response.encoding = "utf-8"
-        return response.text
+        encoding = response.encoding or "utf-8"
+        if "charset=" not in content_type and encoding.casefold() in {"iso-8859-1", "latin-1"}:
+            encoding = "utf-8"
+        return content.decode(encoding, errors="replace")
 
     def _record_from_candidate(self, candidate: WebsiteImageCandidate, search_name: str, index: int) -> PhotoRecord:
         source_id = hashlib.sha1(candidate.image_url.encode("utf-8")).hexdigest()[:20]
@@ -1144,9 +1221,17 @@ class WebsiteImageSource:
 
 
 class _WebsiteImageParser(HTMLParser):
-    def __init__(self, base_url: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        max_links: int = MAX_PAGE_LINKS,
+        max_candidates: int = MAX_PAGE_CANDIDATES,
+    ) -> None:
         super().__init__(convert_charrefs=True)
         self.base_url = base_url
+        self.max_links = max(0, int(max_links))
+        self.max_candidates = max(0, int(max_candidates))
         self.candidates: list[WebsiteImageCandidate] = []
         self.links: list[str] = []
         self._current_link = base_url
@@ -1175,7 +1260,8 @@ class _WebsiteImageParser(HTMLParser):
             self._link_stack.append(self._current_link)
             if href:
                 self._current_link = urljoin(self.base_url, href)
-                self.links.append(self._current_link)
+                if len(self.links) < self.max_links:
+                    self.links.append(self._current_link)
             return
         if tag == "meta":
             self._handle_meta(data)
@@ -1202,6 +1288,8 @@ class _WebsiteImageParser(HTMLParser):
         self._append_candidate(raw_src, thumb_src, data)
 
     def _append_candidate(self, raw_src: str, thumb_src: str, data: dict[str, str]) -> None:
+        if len(self.candidates) >= self.max_candidates:
+            return
         parsed_source = urljoin(self.base_url, raw_src)
         thumb_url = urljoin(self.base_url, thumb_src)
         linked_image = self._current_link if _is_direct_image_url(self._current_link) else ""

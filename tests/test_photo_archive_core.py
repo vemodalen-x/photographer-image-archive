@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import sqlite3
 import threading
 from io import BytesIO
@@ -95,6 +96,102 @@ def test_download_binary_rejects_declared_oversized_image(tmp_path: Path, monkey
 
 def test_release_smoke_validates_packaged_resources() -> None:
     assert photo_archive_app.main(["--release-smoke"]) == 0
+
+
+def test_ui_event_pump_reschedules_after_handler_failure() -> None:
+    events: queue.Queue[tuple[str, dict]] = queue.Queue()
+    events.put(("broken", {}))
+    events.put(("healthy", {}))
+    handled: list[str] = []
+    errors: list[BaseException] = []
+    scheduled: list[int] = []
+
+    def handle(event: str, _payload: dict) -> None:
+        if event == "broken":
+            raise RuntimeError("event failed")
+        handled.append(event)
+
+    harness = SimpleNamespace(
+        ui_queue=events,
+        _handle_event=handle,
+        report_callback_exception=lambda _type, value, _traceback: errors.append(value),
+        winfo_exists=lambda: True,
+        after=lambda delay, _callback: scheduled.append(delay),
+        _drain_queue=lambda: None,
+    )
+
+    photo_archive_app.PhotoArchiveApp._drain_queue(harness)
+
+    assert handled == ["healthy"]
+    assert len(errors) == 1
+    assert scheduled
+
+
+def test_website_fetch_rejects_oversized_html_before_parsing(monkeypatch) -> None:
+    class Response:
+        headers = {
+            "Content-Type": "text/html",
+            "Content-Length": str(photo_archive_core.MAX_WEBSITE_HTML_BYTES + 1),
+        }
+        encoding = "utf-8"
+        url = "https://example.test/gallery"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class Session:
+        headers: dict[str, str] = {}
+
+        def get(self, _url: str, **_kwargs):
+            return Response()
+
+    source = WebsiteImageSource(session=Session())
+    with pytest.raises(photo_archive_core.PhotoArchiveError, match="response limit"):
+        source._fetch_html("https://example.test/gallery")
+
+
+def test_website_fetch_rejects_cross_site_redirect() -> None:
+    class Response:
+        headers = {"Content-Type": "text/html"}
+        encoding = "utf-8"
+        content = b"<html></html>"
+        url = "https://unrelated.test/landing"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class Session:
+        headers: dict[str, str] = {}
+
+        def get(self, _url: str, **_kwargs):
+            return Response()
+
+    source = WebsiteImageSource(session=Session())
+    with pytest.raises(photo_archive_core.PhotoArchiveError, match="redirected outside"):
+        source._fetch_html("https://example.test/gallery")
+
+
+def test_website_parser_bounds_links_and_candidates() -> None:
+    parser = photo_archive_core._WebsiteImageParser(
+        "https://example.test/",
+        max_links=2,
+        max_candidates=2,
+    )
+    parser.feed(
+        "".join(
+            f"<a href='/page-{index}'><img src='/image-{index}.jpg' alt='Work {index}'></a>"
+            for index in range(8)
+        )
+    )
+
+    assert len(parser.links) == 2
+    assert len(parser.candidates) == 2
 
 
 def test_safe_filename_removes_windows_reserved_characters() -> None:

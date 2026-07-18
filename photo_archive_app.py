@@ -1623,14 +1623,20 @@ class PhotoArchiveApp(tk.Tk):
 
         started = time.perf_counter()
         processed = 0
-        while processed < UI_EVENTS_PER_TICK and time.perf_counter() - started < UI_TICK_BUDGET_SECONDS:
-            try:
-                event, payload = self.ui_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._handle_event(event, payload)
-            processed += 1
-        self.after(1 if not self.ui_queue.empty() else 50, self._drain_queue)
+        try:
+            while processed < UI_EVENTS_PER_TICK and time.perf_counter() - started < UI_TICK_BUDGET_SECONDS:
+                try:
+                    event, payload = self.ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle_event(event, payload)
+                except Exception:
+                    self.report_callback_exception(*sys.exc_info())
+                processed += 1
+        finally:
+            if self.winfo_exists():
+                self.after(1 if not self.ui_queue.empty() else 50, self._drain_queue)
 
     def _handle_event(self, event: str, payload: dict) -> None:
         if event == "status":
