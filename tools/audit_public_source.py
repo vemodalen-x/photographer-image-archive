@@ -15,6 +15,20 @@ SECRET_PATTERNS = (
     re.compile(rb"ghp_[A-Za-z0-9]{20,}"),
     re.compile(rb"AKIA[0-9A-Z]{16}"),
 )
+TEXT_SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"ghp_[A-Za-z0-9]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+)
+GENERIC_USER_PATH_PATTERNS = (
+    re.compile(rb"(?i)[A-Z]:(?:\\+|/)Users(?:\\+|/)[A-Za-z0-9._-]+(?:\\+|/)"),
+    re.compile(rb"(?i)/(?:Users|home)/[A-Za-z0-9._-]+/"),
+)
+GENERIC_USER_TEXT_PATH_PATTERNS = (
+    re.compile(r"(?i)[A-Z]:(?:\\+|/)Users(?:\\+|/)[A-Za-z0-9._-]+(?:\\+|/)"),
+    re.compile(r"(?i)/(?:Users|home)/[A-Za-z0-9._-]+/"),
+)
 
 
 class SourceAuditError(RuntimeError):
@@ -57,9 +71,16 @@ def audit_source(root: Path) -> list[str]:
         if suffix in IMAGE_SUFFIXES and not relative.startswith("assets/photo_archive_icons/"):
             violations.append(f"non-icon image is not allowed in public source: {relative}")
         data = path.read_bytes()
-        if any(needle in data for needle in needles):
+        utf16_text = data.decode("utf-16-le", errors="ignore")
+        if (
+            any(needle in data for needle in needles)
+            or any(pattern.search(data) for pattern in GENERIC_USER_PATH_PATTERNS)
+            or any(pattern.search(utf16_text) for pattern in GENERIC_USER_TEXT_PATH_PATTERNS)
+        ):
             violations.append(f"machine-specific home path found: {relative}")
-        if any(pattern.search(data) for pattern in SECRET_PATTERNS):
+        if any(pattern.search(data) for pattern in SECRET_PATTERNS) or any(
+            pattern.search(utf16_text) for pattern in TEXT_SECRET_PATTERNS
+        ):
             violations.append(f"credential-like content found: {relative}")
     return violations
 

@@ -85,6 +85,9 @@ def build() -> tuple[Path, Path]:
     shutil.copy2(executable, stage / executable.name)
     for name in PUBLIC_DOCUMENTS:
         shutil.copy2(ROOT / name, stage / name)
+    third_party_licenses = stage / "THIRD_PARTY_LICENSES"
+    third_party_licenses.mkdir()
+    shutil.copy2(ROOT / "assets" / "photo_archive_icons" / "LICENSE.txt", third_party_licenses / "LUCIDE.txt")
 
     zip_path = dist_root / f"{PACKAGE_ROOT_NAME}.zip"
     _write_deterministic_zip(stage, zip_path)

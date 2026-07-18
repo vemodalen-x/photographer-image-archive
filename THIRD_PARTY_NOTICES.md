@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-- Lucide icons are redistributed under the ISC License. The bundled notice is in `assets/photo_archive_icons/LICENSE.txt`.
+- Lucide icons are redistributed under the ISC License. The bundled release notice is in `THIRD_PARTY_LICENSES/LUCIDE.txt`.
 - Requests is distributed under the Apache License 2.0.
 - Pillow is distributed under the HPND License.
 - PyInstaller is used to create the Windows executable and is distributed under GPL-2.0-or-later with an exception that permits bundling applications.

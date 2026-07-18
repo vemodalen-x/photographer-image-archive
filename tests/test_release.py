@@ -18,6 +18,7 @@ EXPECTED_FILES = {
     "CHANGELOG.md": b"changes",
     "PRIVACY.md": b"privacy",
     "THIRD_PARTY_NOTICES.md": b"notices",
+    "THIRD_PARTY_LICENSES/LUCIDE.txt": b"lucide license",
 }
 
 
@@ -64,6 +65,15 @@ def test_release_verifier_rejects_utf16_user_path(tmp_path: Path) -> None:
         verify_release(zip_path, checksum, VERSION)
 
 
+def test_release_verifier_rejects_utf16_credential(tmp_path: Path) -> None:
+    files = dict(EXPECTED_FILES)
+    token = ("ghp_" + "A" * 32).encode("utf-16-le")
+    files["PhotographerImageArchive.exe"] += token
+    zip_path, checksum = _package(tmp_path, files)
+    with pytest.raises(ReleaseVerificationError, match="credential-like"):
+        verify_release(zip_path, checksum, VERSION)
+
+
 def test_release_verifier_rejects_wrong_checksum(tmp_path: Path) -> None:
     zip_path, checksum = _package(tmp_path)
     checksum.write_text(f"{'0' * 64}  {zip_path.name}\n", encoding="utf-8")
@@ -85,3 +95,17 @@ def test_source_audit_ignores_generated_virtual_environments(tmp_path: Path) -> 
     (generated / "python.exe").write_bytes(b"generated runtime")
 
     assert audit_source(tmp_path) == []
+
+
+def test_source_audit_rejects_another_developer_home_path(tmp_path: Path) -> None:
+    private_path = "C:" + "\\Users\\" + "AnotherDeveloper\\Pictures\\archive.db"
+    (tmp_path / "config.py").write_text(f"ARCHIVE = {private_path!r}\n", encoding="utf-8")
+
+    assert audit_source(tmp_path)
+
+
+def test_source_audit_rejects_utf16_credential(tmp_path: Path) -> None:
+    token = ("ghp_" + "B" * 32).encode("utf-16-le")
+    (tmp_path / "resource.bin").write_bytes(token)
+
+    assert audit_source(tmp_path)

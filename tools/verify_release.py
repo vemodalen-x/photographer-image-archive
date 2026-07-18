@@ -36,6 +36,12 @@ SECRET_PATTERNS = (
     re.compile(rb"ghp_[A-Za-z0-9]{20,}"),
     re.compile(rb"AKIA[0-9A-Z]{16}"),
 )
+TEXT_SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"ghp_[A-Za-z0-9]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+)
 
 
 class ReleaseVerificationError(RuntimeError):
@@ -59,6 +65,7 @@ def _expected_entries(version: str) -> set[str]:
         f"{root}/CHANGELOG.md",
         f"{root}/PRIVACY.md",
         f"{root}/THIRD_PARTY_NOTICES.md",
+        f"{root}/THIRD_PARTY_LICENSES/LUCIDE.txt",
     }
 
 
@@ -76,7 +83,9 @@ def _check_content(name: str, data: bytes) -> None:
         pattern.search(utf16_text) for pattern in TEXT_PATH_PATTERNS
     ):
         raise ReleaseVerificationError(f"absolute user path embedded in {name}")
-    if any(pattern.search(data) for pattern in SECRET_PATTERNS):
+    if any(pattern.search(data) for pattern in SECRET_PATTERNS) or any(
+        pattern.search(utf16_text) for pattern in TEXT_SECRET_PATTERNS
+    ):
         raise ReleaseVerificationError(f"credential-like content embedded in {name}")
 
 

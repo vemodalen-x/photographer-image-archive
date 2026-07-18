@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from typing import Callable, Iterable, Optional
 from urllib.parse import unquote, urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
@@ -60,6 +60,7 @@ MAX_SITEMAP_BYTES = 8 * 1024 * 1024
 MAX_QUEUED_PAGES = 512
 MAX_PAGE_LINKS = 4096
 MAX_PAGE_CANDIDATES = 4096
+MAX_SAME_SITE_REDIRECTS = 5
 
 ProgressCallback = Callable[[str, dict], None]
 
@@ -700,6 +701,17 @@ class WebsiteImageCandidate:
     dimensions_verified: bool = False
 
 
+def _terminate_process(process) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 class BrowserDOMRenderer:
     """Render public JavaScript pages in an isolated local Chromium profile.
 
@@ -750,11 +762,11 @@ class BrowserDOMRenderer:
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             dom_path = Path(profile) / "rendered-dom.html"
             error_path = Path(profile) / "renderer-error.log"
-            with dom_path.open("wb") as dom_handle, error_path.open("wb") as error_handle:
+            with error_path.open("wb") as error_handle:
                 try:
                     process = subprocess.Popen(
                         command,
-                        stdout=dom_handle,
+                        stdout=subprocess.PIPE,
                         stderr=error_handle,
                         creationflags=creationflags,
                     )
@@ -762,40 +774,77 @@ class BrowserDOMRenderer:
                     _emit(callback, "source_notice", message=f"Dynamic renderer unavailable: {exc}")
                     return ""
 
+                limit_exceeded = Event()
+                reader_errors: list[Exception] = []
+
+                def capture_stdout() -> None:
+                    total = 0
+                    try:
+                        if process.stdout is None:
+                            return
+                        with dom_path.open("wb") as dom_handle:
+                            while True:
+                                chunk = process.stdout.read(256 * 1024)
+                                if not chunk:
+                                    break
+                                remaining = MAX_RENDERED_DOM_CHARS - total
+                                if len(chunk) > remaining:
+                                    if remaining > 0:
+                                        dom_handle.write(chunk[:remaining])
+                                    limit_exceeded.set()
+                                    break
+                                dom_handle.write(chunk)
+                                total += len(chunk)
+                    except Exception as exc:
+                        reader_errors.append(exc)
+
+                reader = Thread(target=capture_stdout, name="photo-archive-dom-reader", daemon=True)
+                reader.start()
+
                 deadline = time.monotonic() + BROWSER_RENDER_TIMEOUT_SECONDS
                 while True:
+                    if limit_exceeded.is_set():
+                        _terminate_process(process)
+                        reader.join(timeout=2)
+                        _emit(
+                            callback,
+                            "source_notice",
+                            message=f"Dynamic page exceeded the {MAX_RENDERED_DOM_CHARS // (1024 * 1024)} MB DOM limit and was skipped: {url}",
+                        )
+                        return ""
                     try:
                         process.wait(timeout=0.2)
                         break
                     except subprocess.TimeoutExpired:
                         if cancel_event is not None and cancel_event.is_set():
-                            process.terminate()
-                            try:
-                                process.wait(timeout=2)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                                process.wait()
+                            _terminate_process(process)
+                            reader.join(timeout=2)
                             raise SearchCancelled("Search cancelled by user.")
                         if time.monotonic() >= deadline:
-                            process.terminate()
-                            try:
-                                process.wait(timeout=2)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                                process.wait()
+                            _terminate_process(process)
+                            reader.join(timeout=2)
                             _emit(callback, "source_notice", message=f"Dynamic rendering timed out: {url}")
                             return ""
+
+                reader.join(timeout=2)
+                if reader.is_alive():
+                    _terminate_process(process)
+                    _emit(callback, "source_notice", message=f"Dynamic rendering output did not close: {url}")
+                    return ""
+                if reader_errors:
+                    _emit(callback, "source_notice", message=f"Dynamic rendering output failed: {reader_errors[0]}")
+                    return ""
+                if limit_exceeded.is_set():
+                    _emit(
+                        callback,
+                        "source_notice",
+                        message=f"Dynamic page exceeded the {MAX_RENDERED_DOM_CHARS // (1024 * 1024)} MB DOM limit and was skipped: {url}",
+                    )
+                    return ""
 
             if process.returncode != 0:
                 detail = html_to_text(error_path.read_bytes()[-4096:].decode("utf-8", errors="replace"))[-240:]
                 _emit(callback, "source_notice", message=f"Dynamic rendering failed: {detail or process.returncode}")
-                return ""
-            if dom_path.stat().st_size > MAX_RENDERED_DOM_CHARS:
-                _emit(
-                    callback,
-                    "source_notice",
-                    message=f"Dynamic page exceeded the {MAX_RENDERED_DOM_CHARS // (1024 * 1024)} MB DOM limit and was skipped: {url}",
-                )
                 return ""
             stdout = dom_path.read_text(encoding="utf-8", errors="replace")
             return stdout if "<" in stdout else ""
@@ -1156,23 +1205,37 @@ class WebsiteImageSource:
         expected_host: str,
         label: str,
     ):
-        try:
-            response = self.session.get(url, timeout=timeout, stream=True)
-        except TypeError as exc:
-            if "stream" not in str(exc):
-                raise
-            response = self.session.get(url, timeout=timeout)
-        try:
-            response.raise_for_status()
-            final_url = str(getattr(response, "url", "") or url)
-            if not _same_site_host(urlparse(final_url).netloc, expected_host):
-                raise PhotoArchiveError(f"{label} redirected outside the official site: {final_url}")
-            content = _bounded_response_content(response, max_bytes, label)
-            return response, content
-        finally:
-            close = getattr(response, "close", None)
-            if callable(close):
-                close()
+        current_url = url
+        for redirect_count in range(MAX_SAME_SITE_REDIRECTS + 1):
+            if not _same_site_host(urlparse(current_url).netloc, expected_host):
+                raise PhotoArchiveError(f"{label} redirected outside the official site: {current_url}")
+            response = self.session.get(
+                current_url,
+                timeout=timeout,
+                stream=True,
+                allow_redirects=False,
+            )
+            try:
+                status_code = int(getattr(response, "status_code", 200) or 200)
+                if status_code in {301, 302, 303, 307, 308}:
+                    location = str(response.headers.get("Location", "")).strip()
+                    if not location:
+                        raise PhotoArchiveError(f"{label} returned a redirect without a location")
+                    if redirect_count >= MAX_SAME_SITE_REDIRECTS:
+                        raise PhotoArchiveError(f"{label} exceeded the redirect limit")
+                    current_url = urljoin(current_url, location)
+                    continue
+                response.raise_for_status()
+                final_url = str(getattr(response, "url", "") or current_url)
+                if not _same_site_host(urlparse(final_url).netloc, expected_host):
+                    raise PhotoArchiveError(f"{label} redirected outside the official site: {final_url}")
+                content = _bounded_response_content(response, max_bytes, label)
+                return response, content
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+        raise PhotoArchiveError(f"{label} exceeded the redirect limit")
 
     def _fetch_html(self, url: str, start_host: str = "") -> str:
         start_host = start_host or urlparse(url).netloc.lower()
@@ -1334,6 +1397,9 @@ class _WebsiteImageParser(HTMLParser):
         key = _first_non_empty(data.get("property"), data.get("name")).casefold()
         content = data.get("content", "").strip()
         if key in {"og:image", "og:image:url", "twitter:image", "twitter:image:src"} and content:
+            if len(self.candidates) >= self.max_candidates:
+                self._last_meta_candidate = None
+                return
             candidate = WebsiteImageCandidate(
                 image_url=urljoin(self.base_url, content),
                 thumb_url=urljoin(self.base_url, content),

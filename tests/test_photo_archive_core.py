@@ -177,6 +177,31 @@ def test_website_fetch_rejects_cross_site_redirect() -> None:
         source._fetch_html("https://example.test/gallery")
 
 
+def test_website_fetch_does_not_visit_cross_site_redirect_target() -> None:
+    requested: list[str] = []
+
+    class Response:
+        headers = {"Location": "http://127.0.0.1/private"}
+        status_code = 302
+        url = "https://example.test/gallery"
+
+        def close(self) -> None:
+            return None
+
+    class Session:
+        headers: dict[str, str] = {}
+
+        def get(self, url: str, **_kwargs):
+            requested.append(url)
+            return Response()
+
+    source = WebsiteImageSource(session=Session())
+    with pytest.raises(photo_archive_core.PhotoArchiveError, match="redirected outside"):
+        source._fetch_html("https://example.test/gallery")
+
+    assert requested == ["https://example.test/gallery"]
+
+
 def test_website_parser_bounds_links_and_candidates() -> None:
     parser = photo_archive_core._WebsiteImageParser(
         "https://example.test/",
@@ -191,6 +216,21 @@ def test_website_parser_bounds_links_and_candidates() -> None:
     )
 
     assert len(parser.links) == 2
+    assert len(parser.candidates) == 2
+
+
+def test_website_parser_applies_candidate_limit_to_social_meta_images() -> None:
+    parser = photo_archive_core._WebsiteImageParser(
+        "https://example.test/",
+        max_candidates=2,
+    )
+    parser.feed(
+        "".join(
+            f"<meta property='og:image' content='/social-{index}.jpg'>"
+            for index in range(20)
+        )
+    )
+
     assert len(parser.candidates) == 2
 
 
@@ -363,7 +403,7 @@ def test_website_html_uses_detected_encoding_when_charset_is_missing() -> None:
     class FakeSession:
         headers: dict[str, str] = {}
 
-        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+        def get(self, url: str, timeout: tuple[int, int], **_kwargs) -> FakeResponse:
             return FakeResponse()
 
     source = WebsiteImageSource(session=FakeSession())
@@ -394,7 +434,7 @@ def test_website_source_extracts_fullsize_images_and_skips_logo() -> None:
     class FakeSession:
         headers: dict[str, str] = {}
 
-        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+        def get(self, url: str, timeout: tuple[int, int], **_kwargs) -> FakeResponse:
             return FakeResponse()
 
     result = WebsiteImageSource(session=FakeSession()).search(
@@ -426,7 +466,7 @@ def test_website_source_uses_page_collection_and_figure_caption() -> None:
     class FakeSession:
         headers: dict[str, str] = {}
 
-        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+        def get(self, url: str, timeout: tuple[int, int], **_kwargs) -> FakeResponse:
             if url.endswith("robots.txt"):
                 return FakeResponse("")
             return FakeResponse(
@@ -476,7 +516,7 @@ def test_website_source_does_not_apply_thumbnail_display_size_to_linked_original
     class FakeSession:
         headers: dict[str, str] = {}
 
-        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+        def get(self, url: str, timeout: tuple[int, int], **_kwargs) -> FakeResponse:
             if url.endswith("robots.txt"):
                 return FakeResponse("")
             return FakeResponse(
@@ -517,7 +557,7 @@ def test_website_source_can_recover_fullsize_after_low_resolution_variant() -> N
     class FakeSession:
         headers: dict[str, str] = {}
 
-        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+        def get(self, url: str, timeout: tuple[int, int], **_kwargs) -> FakeResponse:
             if url.endswith("robots.txt"):
                 return FakeResponse("")
             if url.endswith("/fullsize/"):
@@ -560,7 +600,7 @@ def test_website_source_expands_declared_dynamic_gallery_even_with_static_previe
     class FakeSession:
         headers: dict[str, str] = {}
 
-        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+        def get(self, url: str, timeout: tuple[int, int], **_kwargs) -> FakeResponse:
             if url.endswith("robots.txt"):
                 return FakeResponse("")
             return FakeResponse(
@@ -648,7 +688,7 @@ def test_website_source_renders_dynamic_dom_only_when_static_page_has_no_images(
     class FakeSession:
         headers: dict[str, str] = {}
 
-        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+        def get(self, url: str, timeout: tuple[int, int], **_kwargs) -> FakeResponse:
             if url.endswith("/robots.txt"):
                 return FakeResponse("User-agent: *\nAllow: /")
             return FakeResponse("<html><body><div id='app'></div></body></html>")
@@ -688,7 +728,7 @@ def test_website_source_does_not_render_when_static_html_has_work_image() -> Non
     class FakeSession:
         headers: dict[str, str] = {}
 
-        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+        def get(self, url: str, timeout: tuple[int, int], **_kwargs) -> FakeResponse:
             return FakeResponse()
 
     class FailingRenderer:
@@ -722,19 +762,32 @@ def test_browser_renderer_command_uses_isolated_profile_and_keeps_sandbox(tmp_pa
 def test_browser_renderer_skips_oversized_dom_without_failing_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     executable = tmp_path / "chrome.exe"
     executable.touch()
+    profile = tmp_path / "isolated-profile"
+    profile.mkdir()
+
+    class FixedTemporaryDirectory:
+        def __enter__(self):
+            return str(profile)
+
+        def __exit__(self, *_args):
+            return False
 
     class FakeProcess:
         returncode = 0
+        stdout = BytesIO(("<html>" + "x" * 80 + "</html>").encode("utf-8"))
 
         def wait(self, timeout=None):
             return 0
 
+        def poll(self):
+            return 0
+
     def fake_popen(*args, **kwargs):
-        kwargs["stdout"].write(("<html>" + "x" * 80 + "</html>").encode("utf-8"))
-        kwargs["stdout"].flush()
+        assert kwargs["stdout"] == photo_archive_core.subprocess.PIPE
         return FakeProcess()
 
     monkeypatch.setattr(photo_archive_core.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(photo_archive_core.tempfile, "TemporaryDirectory", lambda **_kwargs: FixedTemporaryDirectory())
     monkeypatch.setattr(photo_archive_core, "MAX_RENDERED_DOM_CHARS", 64)
     events: list[tuple[str, dict]] = []
 
@@ -745,6 +798,7 @@ def test_browser_renderer_skips_oversized_dom_without_failing_search(tmp_path: P
 
     assert result == ""
     assert any(event == "source_notice" and "DOM limit" in payload["message"] for event, payload in events)
+    assert (profile / "rendered-dom.html").stat().st_size == 64
 
 
 def test_discover_official_website_uses_wikidata_official_site() -> None:
@@ -1046,7 +1100,7 @@ def test_website_search_cancellation_keeps_already_emitted_record() -> None:
     class FakeSession:
         headers: dict[str, str] = {}
 
-        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+        def get(self, url: str, timeout: tuple[int, int], **_kwargs) -> FakeResponse:
             if url.endswith("/robots.txt"):
                 return FakeResponse("User-agent: *\nAllow: /")
             return FakeResponse(
