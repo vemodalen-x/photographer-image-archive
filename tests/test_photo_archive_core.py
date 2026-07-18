@@ -1,0 +1,1270 @@
+from __future__ import annotations
+
+import sqlite3
+import threading
+from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import photo_archive_app
+import photo_archive_core
+from photo_archive_app import (
+    GALLERY_PAGE_SIZE,
+    GALLERY_REFLOW_DELAY_MS,
+    MAX_THUMBNAIL_CACHE_ITEMS,
+    THUMBNAIL_WORKERS,
+    UI_EVENTS_PER_TICK,
+    UI_TICK_BUDGET_SECONDS,
+    _decode_study_image,
+    _gallery_page_window,
+    _record_matches_scope,
+)
+from photo_archive_core import (
+    MAX_IMAGE_DOWNLOAD_BYTES,
+    ArchiveStore,
+    BrowserDOMRenderer,
+    PhotoRecord,
+    SearchCancelled,
+    SearchResult,
+    WebsiteImageSource,
+    WikimediaCommonsSource,
+    _download_binary,
+    archive_photographer,
+    create_contact_sheet_pages,
+    dhash_file,
+    discover_official_website,
+    extract_exif_details,
+    find_near_duplicate,
+    hamming_distance_hex,
+    html_to_text,
+    normalize_research_tags,
+    render_research_markdown,
+    safe_filename,
+    sha256_file,
+)
+
+
+def test_archive_store_explicitly_closes_every_connection(tmp_path: Path, monkeypatch) -> None:
+    opened: list[sqlite3.Connection] = []
+    closed: list[sqlite3.Connection] = []
+
+    class TrackingConnection(sqlite3.Connection):
+        def close(self) -> None:
+            closed.append(self)
+            super().close()
+
+    original_connect = sqlite3.connect
+
+    def tracking_connect(*args, **kwargs):
+        kwargs["factory"] = TrackingConnection
+        connection = original_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(photo_archive_core.sqlite3, "connect", tracking_connect)
+    store = ArchiveStore(tmp_path / "archive.db")
+    store.list_records()
+
+    assert opened
+    assert len(closed) == len(opened)
+
+
+def test_download_binary_rejects_declared_oversized_image(tmp_path: Path, monkeypatch) -> None:
+    class OversizedResponse:
+        headers = {"Content-Length": str(MAX_IMAGE_DOWNLOAD_BYTES + 1)}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def raise_for_status(self) -> None:
+            return None
+
+    monkeypatch.setattr(photo_archive_core.requests, "get", lambda *_args, **_kwargs: OversizedResponse())
+    destination = tmp_path / "oversized.part"
+
+    with pytest.raises(photo_archive_core.PhotoArchiveError, match="512 MiB"):
+        _download_binary("https://example.test/oversized.jpg", destination)
+
+    assert not destination.exists()
+
+
+def test_release_smoke_validates_packaged_resources() -> None:
+    assert photo_archive_app.main(["--release-smoke"]) == 0
+
+
+def test_safe_filename_removes_windows_reserved_characters() -> None:
+    assert safe_filename('A/B:C*D?"E<F>G|.jpg') == "A_B_C_D__E_F_G_.jpg"
+
+
+def test_ui_work_is_bounded_per_tick() -> None:
+    assert THUMBNAIL_WORKERS == 4
+    assert UI_EVENTS_PER_TICK <= 24
+    assert UI_TICK_BUDGET_SECONDS <= 0.008
+    assert GALLERY_REFLOW_DELAY_MS <= 100
+    assert GALLERY_PAGE_SIZE <= 60
+    assert MAX_THUMBNAIL_CACHE_ITEMS <= GALLERY_PAGE_SIZE * 3
+
+
+def test_gallery_page_window_bounds_large_result_sets() -> None:
+    keys = [f"image-{index}" for index in range(113)]
+
+    first, first_page, page_count = _gallery_page_window(keys, 0)
+    last, last_page, last_page_count = _gallery_page_window(keys, 99)
+
+    assert len(first) == GALLERY_PAGE_SIZE
+    assert first_page == 0
+    assert page_count == 3
+    assert last == keys[GALLERY_PAGE_SIZE * 2 :]
+    assert last_page == 2
+    assert last_page_count == 3
+
+
+def test_research_scope_filters_are_direct_and_non_overlapping() -> None:
+    record = PhotoRecord(
+        source="website",
+        source_id="scope-1",
+        search_name="Example Photographer",
+        title="Study",
+        page_url="https://example.test/work/1",
+        image_url="https://example.test/work/1.jpg",
+        width=2400,
+        height=1600,
+        local_path="C:/archive/work-1.jpg",
+        research_note="Color relationship",
+        research_tags="color",
+        rating=4,
+    )
+
+    assert _record_matches_scope(record, "all")
+    assert _record_matches_scope(record, "high_resolution")
+    assert _record_matches_scope(record, "downloaded")
+    assert _record_matches_scope(record, "rated")
+    assert _record_matches_scope(record, "noted")
+    assert not _record_matches_scope(record, "unreviewed")
+
+
+def test_batch_download_uses_complete_filtered_result_set() -> None:
+    first = PhotoRecord(
+        source="website",
+        source_id="filtered-1",
+        search_name="Example Photographer",
+        title="First",
+        page_url="https://example.test/1",
+        image_url="https://example.test/1.jpg",
+    )
+    second = PhotoRecord(
+        source="website",
+        source_id="filtered-2",
+        search_name="Example Photographer",
+        title="Second",
+        page_url="https://example.test/2",
+        image_url="https://example.test/2.jpg",
+    )
+    records = {first.source_key: first, second.source_key: second}
+    received: list[PhotoRecord] = []
+    harness = SimpleNamespace(
+        _visible_source_keys=lambda: [first.source_key, second.source_key],
+        _record_for_source_key=records.get,
+        _start_record_download=lambda selected: received.extend(selected),
+    )
+
+    photo_archive_app.PhotoArchiveApp._download_current_list(harness)
+
+    assert received == [first, second]
+
+
+def test_study_image_decode_caps_pixel_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    pillow = pytest.importorskip("PIL.Image")
+    source = pillow.new("RGB", (400, 300), "#126B5C")
+    buffer = BytesIO()
+    source.save(buffer, format="JPEG")
+    monkeypatch.setattr(photo_archive_app, "MAX_STUDY_DECODE_PIXELS", 20_000)
+
+    decoded = _decode_study_image(buffer.getvalue())
+
+    assert decoded.width * decoded.height <= 20_000
+    decoded.close()
+
+
+def test_photo_archive_icon_assets_are_packaged_and_transparent() -> None:
+    pillow = pytest.importorskip("PIL.Image")
+    root = Path(__file__).resolve().parents[1]
+    icon_dir = root / "assets" / "photo_archive_icons"
+    app_icon = pillow.open(icon_dir / "app_icon_256.png").convert("RGBA")
+
+    assert app_icon.size == (256, 256)
+    assert app_icon.getpixel((0, 0))[3] == 0
+    assert app_icon.getbbox() is not None
+    assert "ISC License" in (icon_dir / "LICENSE.txt").read_text(encoding="utf-8")
+    spec = (root / "PhotographerImageArchive.spec").read_text(encoding="utf-8")
+    assert "photo_archive_icons" in spec
+    assert "photo_archive_app.ico" in spec
+    for name in ("maximize", "scan", "columns-2", "layout-grid", "chevron-left", "chevron-right"):
+        assert (icon_dir / "png" / f"{name}-dark.png").exists()
+
+
+def test_contact_sheet_export_paginates_and_keeps_missing_preview(tmp_path: Path) -> None:
+    pillow = pytest.importorskip("PIL.Image")
+    items: list[tuple[PhotoRecord, bytes | None]] = []
+    for index in range(13):
+        content = None
+        if index != 4:
+            image = pillow.new("RGB", (800, 600), (20 + index * 8, 90, 140))
+            buffer = BytesIO()
+            image.save(buffer, format="JPEG")
+            content = buffer.getvalue()
+        items.append(
+            (
+                PhotoRecord(
+                    source="website",
+                    source_id=str(index),
+                    search_name="Example Photographer",
+                    title=f"Study work {index}",
+                    page_url=f"https://example.test/{index}",
+                    image_url=f"https://example.test/{index}.jpg",
+                    width=2400,
+                    height=1600,
+                    match_confidence=95,
+                ),
+                content,
+            )
+        )
+
+    paths = create_contact_sheet_pages(items, tmp_path / "contact.jpg", "Example Photographer")
+
+    assert [path.name for path in paths] == ["contact_p01.jpg", "contact_p02.jpg"]
+    assert all(path.exists() for path in paths)
+    with pillow.open(paths[0]) as page:
+        assert page.format == "JPEG"
+        assert page.size == (1280, 920)
+        assert page.getbbox() is not None
+
+
+def test_html_to_text_strips_tags_and_unescapes_entities() -> None:
+    assert html_to_text("<p>Henri&nbsp;<b>Cartier-Bresson</b><br>Paris</p>") == "Henri Cartier-Bresson\nParis"
+
+
+def test_website_html_uses_detected_encoding_when_charset_is_missing() -> None:
+    class FakeResponse:
+        headers = {"Content-Type": "text/html"}
+        encoding = "ISO-8859-1"
+        apparent_encoding = "utf-8"
+        content = "北京，1965".encode("utf-8")
+
+        @property
+        def text(self) -> str:
+            return self.content.decode(self.encoding)
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeSession:
+        headers: dict[str, str] = {}
+
+        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+            return FakeResponse()
+
+    source = WebsiteImageSource(session=FakeSession())
+
+    assert source._fetch_html("https://example.test/") == "北京，1965"
+
+
+def test_website_source_extracts_fullsize_images_and_skips_logo() -> None:
+    class FakeResponse:
+        headers = {"Content-Type": "text/html"}
+        encoding = "utf-8"
+        text = """
+        <html><body>
+          <img data-src="/logo.png" alt="Example Photographer">
+          <a href="?itemId=photo-1">
+            <img
+              data-src="https://images.example.test/photo-1-640.jpg"
+              data-image="https://images.example.test/photo-1.jpg"
+              data-image-dimensions="2500x1668"
+              alt="A person crossing a street">
+          </a>
+        </body></html>
+        """
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeSession:
+        headers: dict[str, str] = {}
+
+        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+            return FakeResponse()
+
+    result = WebsiteImageSource(session=FakeSession()).search(
+        "https://example.test/",
+        search_name="Example Photographer",
+        limit=5,
+        min_long_edge=1080,
+    )
+
+    assert len(result.records) == 1
+    assert result.records[0].image_url == "https://images.example.test/photo-1.jpg"
+    assert result.records[0].thumb_url == "https://images.example.test/photo-1-640.jpg"
+    assert result.records[0].page_url == "https://example.test/?itemId=photo-1"
+    assert result.records[0].resolution == "2500x1668"
+
+
+def test_website_source_uses_page_collection_and_figure_caption() -> None:
+    class FakeResponse:
+        headers = {"Content-Type": "text/html"}
+        encoding = "utf-8"
+
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.content = text.encode("utf-8")
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeSession:
+        headers: dict[str, str] = {}
+
+        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+            if url.endswith("robots.txt"):
+                return FakeResponse("")
+            return FakeResponse(
+                """
+                <html><head><title>American Prospects | Example Photographer</title></head><body>
+                  <figure>
+                    <img src="/images/f0a163bc9a1d4f9082d40ee150b6c701-2500x1667.jpg"
+                         data-image-dimensions="2500x1667">
+                    <figcaption>McLean, Virginia, December 4, 1978</figcaption>
+                  </figure>
+                </body></html>
+                """
+            )
+
+    result = WebsiteImageSource(session=FakeSession()).search(
+        "https://example.test/american-prospects/",
+        search_name="Example Photographer",
+        limit=1,
+        min_long_edge=1080,
+    )
+
+    assert len(result.records) == 1
+    assert result.records[0].collection_title == "American Prospects"
+    assert result.records[0].title == "McLean, Virginia, December 4, 1978"
+    assert result.records[0].annotation == "McLean, Virginia, December 4, 1978"
+
+
+def test_machine_image_title_detects_hash_with_dimension_suffix() -> None:
+    title = "f0a1634bdc3437274b6f0b3162d8206e7aa351c5-10328x8262"
+
+    assert photo_archive_core._looks_like_machine_image_title(title, f"https://images.test/{title}.jpg")
+
+
+def test_website_source_does_not_apply_thumbnail_display_size_to_linked_original() -> None:
+    class FakeResponse:
+        headers = {"Content-Type": "text/html"}
+        encoding = "utf-8"
+        content = b""
+
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.content = text.encode("utf-8")
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeSession:
+        headers: dict[str, str] = {}
+
+        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+            if url.endswith("robots.txt"):
+                return FakeResponse("")
+            return FakeResponse(
+                """
+                <a href="/uploads/work-001.jpg">
+                  <img src="/uploads/work-001-175x265.jpg" width="175" height="265" alt="Paris, 1953">
+                </a>
+                """
+            )
+
+    result = WebsiteImageSource(session=FakeSession()).search(
+        "https://example.test/portfolio/",
+        search_name="Example Photographer",
+        limit=1,
+        min_long_edge=1080,
+    )
+
+    assert len(result.records) == 1
+    assert result.records[0].image_url == "https://example.test/uploads/work-001.jpg"
+    assert result.records[0].thumb_url == "https://example.test/uploads/work-001-175x265.jpg"
+    assert result.records[0].resolution == ""
+    assert result.skipped_low_resolution == 0
+    assert result.unknown_dimensions == 1
+
+
+def test_website_source_can_recover_fullsize_after_low_resolution_variant() -> None:
+    class FakeResponse:
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+        encoding = "utf-8"
+
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.content = text.encode("utf-8")
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeSession:
+        headers: dict[str, str] = {}
+
+        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+            if url.endswith("robots.txt"):
+                return FakeResponse("")
+            if url.endswith("/fullsize/"):
+                return FakeResponse(
+                    "<img src='/images/work.jpg' data-image-dimensions='2400x1600' alt='Recovered fullsize work'>"
+                )
+            return FakeResponse(
+                """
+                <a href="/fullsize/">Fullsize gallery</a>
+                <img src="/images/work-300x200.jpg" width="300" height="200" alt="Small work preview">
+                """
+            )
+
+    result = WebsiteImageSource(session=FakeSession()).search(
+        "https://example.test/portfolio/",
+        search_name="Example Photographer",
+        limit=1,
+        min_long_edge=1080,
+    )
+
+    assert result.skipped_low_resolution == 1
+    assert len(result.records) == 1
+    assert result.records[0].title == "Recovered fullsize work"
+    assert result.records[0].resolution == "2400x1600"
+
+
+def test_website_source_expands_declared_dynamic_gallery_even_with_static_previews() -> None:
+    class FakeResponse:
+        headers = {"Content-Type": "text/html"}
+        encoding = "utf-8"
+        content = b""
+
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.content = text.encode("utf-8")
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeSession:
+        headers: dict[str, str] = {}
+
+        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+            if url.endswith("robots.txt"):
+                return FakeResponse("")
+            return FakeResponse(
+                """
+                <script type="application/json" id="__NUXT_DATA__">[{"_id":1,"_type":2,"title":3,"imageCount":4,"galleryThumbnailCount":4},"project-a","project","Series A",3]</script>
+                <img data-image="/static-1.jpg" data-image-dimensions="2400x1600" alt="One">
+                """
+            )
+
+    class FakeRenderer:
+        available = True
+        calls: list[str] = []
+
+        def render(self, url: str, callback=None, cancel_event=None) -> str:
+            self.calls.append(url)
+            return """
+                <img data-image="/dynamic-1.jpg" data-image-dimensions="2400x1600" alt="One">
+                <img data-image="/dynamic-2.jpg" data-image-dimensions="2400x1600" alt="Two">
+                <img data-image="/dynamic-3.jpg" data-image-dimensions="2400x1600" alt="Three">
+            """
+
+    renderer = FakeRenderer()
+    events: list[tuple[str, dict]] = []
+    result = WebsiteImageSource(session=FakeSession(), renderer=renderer).search(
+        "https://example.test/bodies-of-work/example",
+        search_name="Example Photographer",
+        limit=3,
+        min_long_edge=1080,
+        callback=lambda event, payload: events.append((event, payload)),
+    )
+
+    assert renderer.calls == ["https://example.test/bodies-of-work/example"]
+    assert len(result.records) == 3
+    assert {record.title for record in result.records} == {"One", "Two", "Three"}
+    assert result.series_count == 1
+    assert result.declared_total == 3
+    collection_events = [payload for event, payload in events if event == "source_collection"]
+    assert len(collection_events) == 1
+    assert collection_events[0]["series"] == 1
+    assert collection_events[0]["expected"] == 3
+
+
+def test_nuxt_collection_metadata_deduplicates_projects() -> None:
+    values = [
+        {"_id": 1, "_type": 2, "title": 3, "imageCount": 4},
+        "project-a",
+        "project",
+        "Series A",
+        60,
+        {"_id": 1, "_type": 2, "title": 3, "imageCount": 4},
+        {"_id": 7, "_type": 2, "title": 8, "imageCount": 9},
+        "project-b",
+        "Series B",
+        116,
+    ]
+    html = f'<script type="application/json" id="__NUXT_DATA__">{photo_archive_core.json.dumps(values)}</script>'
+
+    collections = photo_archive_core._declared_project_collections(html)
+
+    assert collections == {"project-a": ("Series A", 60), "project-b": ("Series B", 116)}
+
+
+def test_website_page_priority_keeps_work_pages_ahead_of_editorial_pages() -> None:
+    portfolio = photo_archive_core._website_page_priority("https://example.test/bodies-of-work/american-prospects")
+    writing = photo_archive_core._website_page_priority("https://example.test/bodies-of-work/american-prospects/writings/essay")
+    news = photo_archive_core._website_page_priority("https://example.test/news/exhibition-opening")
+
+    assert portfolio > writing
+    assert portfolio > news
+
+
+def test_website_source_renders_dynamic_dom_only_when_static_page_has_no_images() -> None:
+    class FakeResponse:
+        headers = {"Content-Type": "text/html"}
+        encoding = "utf-8"
+        content = b""
+
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.content = text.encode("utf-8")
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeSession:
+        headers: dict[str, str] = {}
+
+        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+            if url.endswith("/robots.txt"):
+                return FakeResponse("User-agent: *\nAllow: /")
+            return FakeResponse("<html><body><div id='app'></div></body></html>")
+
+    class FakeRenderer:
+        available = True
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def render(self, url: str, callback=None, cancel_event=None) -> str:
+            self.calls.append(url)
+            return "<img data-image='/dynamic.jpg' data-image-dimensions='2400x1600' alt='Dynamic work'>"
+
+    renderer = FakeRenderer()
+    result = WebsiteImageSource(session=FakeSession(), renderer=renderer).search(
+        "https://example.test/",
+        "Example Photographer",
+        limit=1,
+        min_long_edge=1080,
+    )
+
+    assert renderer.calls == ["https://example.test/"]
+    assert [record.title for record in result.records] == ["Dynamic work"]
+
+
+def test_website_source_does_not_render_when_static_html_has_work_image() -> None:
+    class FakeResponse:
+        headers = {"Content-Type": "text/html"}
+        encoding = "utf-8"
+        content = b""
+        text = "<img data-image='/static.jpg' data-image-dimensions='2400x1600' alt='Static work'>"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeSession:
+        headers: dict[str, str] = {}
+
+        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+            return FakeResponse()
+
+    class FailingRenderer:
+        available = True
+
+        def render(self, url: str, callback=None, cancel_event=None) -> str:
+            raise AssertionError("renderer should not be called")
+
+    result = WebsiteImageSource(session=FakeSession(), renderer=FailingRenderer()).search(
+        "https://example.test/",
+        "Example Photographer",
+        limit=1,
+        min_long_edge=1080,
+    )
+
+    assert [record.title for record in result.records] == ["Static work"]
+
+
+def test_browser_renderer_command_uses_isolated_profile_and_keeps_sandbox(tmp_path: Path) -> None:
+    renderer = BrowserDOMRenderer(executable=tmp_path / "chrome.exe")
+    profile = tmp_path / "isolated-profile"
+    command = renderer.build_command(profile, "https://example.test/")
+
+    assert f"--user-data-dir={profile}" in command
+    assert "--virtual-time-budget=10000" in command
+    assert "--no-sandbox" not in command
+    assert all("cookie" not in argument.casefold() for argument in command)
+    assert all("profile-directory" not in argument.casefold() for argument in command)
+
+
+def test_browser_renderer_skips_oversized_dom_without_failing_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    executable = tmp_path / "chrome.exe"
+    executable.touch()
+
+    class FakeProcess:
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(*args, **kwargs):
+        kwargs["stdout"].write(("<html>" + "x" * 80 + "</html>").encode("utf-8"))
+        kwargs["stdout"].flush()
+        return FakeProcess()
+
+    monkeypatch.setattr(photo_archive_core.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(photo_archive_core, "MAX_RENDERED_DOM_CHARS", 64)
+    events: list[tuple[str, dict]] = []
+
+    result = BrowserDOMRenderer(executable=executable).render(
+        "https://example.test/gallery",
+        callback=lambda event, payload: events.append((event, payload)),
+    )
+
+    assert result == ""
+    assert any(event == "source_notice" and "DOM limit" in payload["message"] for event, payload in events)
+
+
+def test_discover_official_website_uses_wikidata_official_site() -> None:
+    class FakeResponse:
+        def __init__(self, data: dict) -> None:
+            self._data = data
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._data
+
+    class FakeSession:
+        headers: dict[str, str] = {}
+
+        def get(self, _url: str, params: dict, timeout: tuple[int, int]) -> FakeResponse:
+            if params["action"] == "wbsearchentities":
+                return FakeResponse(
+                    {
+                        "search": [
+                            {
+                                "id": "Q123",
+                                "label": "Daido Moriyama",
+                                "description": "Japanese photographer",
+                            }
+                        ]
+                    }
+                )
+            return FakeResponse(
+                {
+                    "entities": {
+                        "Q123": {
+                            "labels": {"en": {"value": "Daido Moriyama"}},
+                            "descriptions": {"en": {"value": "Japanese photographer"}},
+                            "claims": {
+                                "P856": [
+                                    {
+                                        "mainsnak": {
+                                            "datavalue": {
+                                                "value": "https://www.moriyamadaido.com/"
+                                            }
+                                        }
+                                    }
+                                ],
+                                "P106": [
+                                    {
+                                        "mainsnak": {
+                                            "datavalue": {"value": {"id": "Q33231"}}
+                                        }
+                                    }
+                                ],
+                                "P31": [
+                                    {
+                                        "mainsnak": {
+                                            "datavalue": {"value": {"id": "Q5"}}
+                                        }
+                                    }
+                                ],
+                            },
+                        }
+                    }
+                }
+            )
+
+    events: list[str] = []
+    url = discover_official_website(
+        "Daido Moriyama",
+        session=FakeSession(),
+        callback=lambda event, _payload: events.append(event),
+    )
+
+    assert url == "https://www.moriyamadaido.com/"
+    assert events[0] == "official_site_search"
+    assert "official_site_found" in events
+
+
+def test_discover_official_website_rejects_non_photographer_namesake() -> None:
+    class FakeResponse:
+        def __init__(self, data: dict) -> None:
+            self._data = data
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._data
+
+    class FakeSession:
+        headers: dict[str, str] = {}
+
+        def get(self, _url: str, params: dict, timeout: tuple[int, int]) -> FakeResponse:
+            if params["action"] == "wbsearchentities":
+                return FakeResponse({"search": [{"id": "Q999", "label": "Alex Webb", "description": "business executive"}]})
+            return FakeResponse(
+                {
+                    "entities": {
+                        "Q999": {
+                            "labels": {"en": {"value": "Alex Webb"}},
+                            "descriptions": {"en": {"value": "business executive"}},
+                            "claims": {
+                                "P856": [{"mainsnak": {"datavalue": {"value": "https://wrong.example/"}}}],
+                                "P31": [{"mainsnak": {"datavalue": {"value": {"id": "Q5"}}}}],
+                            },
+                        }
+                    }
+                }
+            )
+
+    events: list[str] = []
+    url = discover_official_website(
+        "Alex Webb",
+        session=FakeSession(),
+        callback=lambda event, _payload: events.append(event),
+    )
+
+    assert url == ""
+    assert "official_site_rejected" in events
+    assert events[-1] == "official_site_missing"
+
+
+def test_commons_source_rejects_general_text_match_without_attribution() -> None:
+    class FakeResponse:
+        headers: dict[str, str] = {}
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            def page(pageid: int, artist: str, description: str) -> dict:
+                return {
+                    "pageid": pageid,
+                    "title": f"File:work-{pageid}.jpg",
+                    "imageinfo": [
+                        {
+                            "url": f"https://upload.example/{pageid}.jpg",
+                            "descriptionurl": f"https://commons.example/{pageid}",
+                            "thumburl": f"https://upload.example/{pageid}-thumb.jpg",
+                            "width": 2400,
+                            "height": 1600,
+                            "mime": "image/jpeg",
+                            "size": 1234,
+                            "extmetadata": {
+                                "Artist": {"value": artist},
+                                "ImageDescription": {"value": description},
+                            },
+                        }
+                    ],
+                }
+
+            return {
+                "query": {
+                    "pages": [
+                        page(1, "Michael Christopher Brown", "Congo project"),
+                        page(2, "Someone Else", "Michael Christopher Brown speaking at an event"),
+                    ]
+                }
+            }
+
+    class FakeSession:
+        headers: dict[str, str] = {}
+
+        def get(self, _url: str, params: dict, timeout: tuple[int, int]) -> FakeResponse:
+            return FakeResponse()
+
+    events: list[str] = []
+    result = WikimediaCommonsSource(session=FakeSession()).search(
+        "Michael Christopher Brown",
+        limit=10,
+        min_long_edge=1080,
+        callback=lambda event, _payload: events.append(event),
+    )
+
+    assert [record.source_id for record in result.records] == ["1"]
+    assert result.records[0].match_confidence == 100
+    assert result.rejected_irrelevant == 1
+    assert "record_rejected" in events
+
+
+def test_archive_uses_auto_discovered_official_site_when_url_is_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def fake_discover(search_name: str, callback=None, cancel_event=None) -> str:
+        calls.append(f"discover:{search_name}")
+        if callback:
+            callback("official_site_found", {"url": "https://example.test/"})
+        return "https://example.test/"
+
+    class FakeWebsiteSource:
+        def search(
+            self,
+            website_url: str,
+            search_name: str,
+            limit: int,
+            min_long_edge: int,
+            callback=None,
+            cancel_event=None,
+        ) -> SearchResult:
+            calls.append(f"website:{website_url}:{search_name}:{limit}:{min_long_edge}")
+            record = PhotoRecord(
+                source="website",
+                source_id="auto-1",
+                search_name=search_name,
+                title="Official site image",
+                page_url=website_url,
+                image_url="https://example.test/image.jpg",
+                width=2500,
+                height=1667,
+            )
+            if callback:
+                callback(
+                    "record_found",
+                    {
+                        "record": record.__dict__,
+                        "title": record.title,
+                        "resolution": record.resolution,
+                        "accepted": 1,
+                        "seen": 1,
+                        "skipped": 0,
+                        "target": limit,
+                    },
+                )
+            return SearchResult(records=[record], found=1, skipped_low_resolution=0)
+
+    monkeypatch.setattr(photo_archive_core, "discover_official_website", fake_discover)
+    monkeypatch.setattr(photo_archive_core, "WebsiteImageSource", FakeWebsiteSource)
+
+    summary = archive_photographer(
+        "Daido Moriyama",
+        output_dir=tmp_path,
+        website_url="",
+        limit=3,
+        min_long_edge=1080,
+        download=False,
+    )
+
+    assert calls == [
+        "discover:Daido Moriyama",
+        "website:https://example.test/:Daido Moriyama:3:1080",
+    ]
+    assert summary.saved == 1
+    assert summary.records[0].page_url == "https://example.test/"
+
+
+def test_archive_persists_emitted_record_before_search_is_cancelled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_discover(search_name: str, callback=None, cancel_event=None) -> str:
+        return "https://example.test/"
+
+    class CancellingWebsiteSource:
+        def search(self, website_url: str, search_name: str, limit: int, min_long_edge: int, callback=None, cancel_event=None) -> SearchResult:
+            record = PhotoRecord(
+                source="website",
+                source_id="persisted-first",
+                search_name=search_name,
+                title="First result",
+                page_url=website_url,
+                image_url="https://example.test/first.jpg",
+                match_confidence=100,
+                match_reason="official website",
+            )
+            callback(
+                "record_found",
+                {
+                    "record": record.__dict__,
+                    "title": record.title,
+                    "resolution": "",
+                    "accepted": 1,
+                    "seen": 1,
+                    "skipped": 0,
+                    "target": limit,
+                },
+            )
+            raise SearchCancelled("stop after first")
+
+    monkeypatch.setattr(photo_archive_core, "discover_official_website", fake_discover)
+    monkeypatch.setattr(photo_archive_core, "WebsiteImageSource", CancellingWebsiteSource)
+
+    with pytest.raises(SearchCancelled):
+        archive_photographer("Example Photographer", output_dir=tmp_path, download=False)
+
+    records = ArchiveStore(tmp_path / "photo_archive.db").list_records("Example Photographer")
+    assert [record.source_id for record in records] == ["persisted-first"]
+
+
+def test_website_search_cancellation_keeps_already_emitted_record() -> None:
+    class FakeResponse:
+        headers = {"Content-Type": "text/html"}
+        encoding = "utf-8"
+        content = b""
+
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.content = text.encode("utf-8")
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeSession:
+        headers: dict[str, str] = {}
+
+        def get(self, url: str, timeout: tuple[int, int]) -> FakeResponse:
+            if url.endswith("/robots.txt"):
+                return FakeResponse("User-agent: *\nAllow: /")
+            return FakeResponse(
+                """
+                <img data-image="/one.jpg" data-image-dimensions="2400x1600" alt="One">
+                <img data-image="/two.jpg" data-image-dimensions="2400x1600" alt="Two">
+                """
+            )
+
+    cancel_event = threading.Event()
+    found: list[str] = []
+
+    def callback(event: str, payload: dict) -> None:
+        if event == "record_found":
+            found.append(str(payload["title"]))
+            cancel_event.set()
+
+    with pytest.raises(SearchCancelled):
+        WebsiteImageSource(session=FakeSession()).search(
+            "https://example.test/",
+            "Example Photographer",
+            limit=5,
+            min_long_edge=1080,
+            callback=callback,
+            cancel_event=cancel_event,
+        )
+
+    assert found == ["One"]
+
+
+def test_sha256_file_is_content_based(tmp_path: Path) -> None:
+    left = tmp_path / "left.bin"
+    right = tmp_path / "right.bin"
+    left.write_bytes(b"same image bytes")
+    right.write_bytes(b"same image bytes")
+
+    assert sha256_file(left) == sha256_file(right)
+
+
+def test_dhash_detects_near_duplicate(tmp_path: Path) -> None:
+    pillow = pytest.importorskip("PIL.Image")
+    base = tmp_path / "base.jpg"
+    changed = tmp_path / "changed.jpg"
+
+    image = pillow.new("RGB", (80, 80), "white")
+    for x in range(20, 60):
+        for y in range(20, 60):
+            image.putpixel((x, y), (20, 20, 20))
+    image.save(base)
+
+    image.putpixel((3, 3), (250, 250, 250))
+    image.save(changed)
+
+    base_hash = dhash_file(base)
+    changed_hash = dhash_file(changed)
+
+    assert base_hash
+    assert changed_hash
+    assert hamming_distance_hex(base_hash, changed_hash) <= 2
+
+
+def test_extract_exif_details_reads_shooting_metadata_without_gps(tmp_path: Path) -> None:
+    pillow = pytest.importorskip("PIL.Image")
+    path = tmp_path / "with-exif.jpg"
+    image = pillow.new("RGB", (32, 24), "white")
+    exif = pillow.Exif()
+    exif[271] = "Leica Camera AG"
+    exif[272] = "LEICA Q2"
+    exif[36867] = "2024:01:02 03:04:05"
+    exif[34855] = 400
+    exif[34853] = {1: "private location"}
+    image.save(path, exif=exif)
+
+    details = extract_exif_details(path)
+
+    assert details["camera_make"] == "Leica Camera AG"
+    assert details["camera_model"] == "LEICA Q2"
+    assert details["shooting_date"] == "2024:01:02 03:04:05"
+    assert details["iso"] == "400"
+    assert "gps" not in " ".join(details).casefold()
+
+
+def test_find_near_duplicate_uses_dhash_not_title() -> None:
+    record = PhotoRecord(
+        source="wikimedia_commons",
+        source_id="2",
+        search_name="Example",
+        title="Different title",
+        page_url="https://example.test/2",
+        image_url="https://example.test/2.jpg",
+        dhash="ffff0000ffff0000",
+    )
+    candidate = PhotoRecord(
+        source="wikimedia_commons",
+        source_id="1",
+        search_name="Example",
+        title="Original",
+        page_url="https://example.test/1",
+        image_url="https://example.test/1.jpg",
+        dhash="ffff0000ffff0001",
+    )
+
+    result = find_near_duplicate(record, [candidate], max_distance=1)
+
+    assert result is not None
+    assert result[0].source_id == "1"
+    assert result[1] == 1
+
+
+def test_archive_store_preserves_download_fields_on_metadata_refresh(tmp_path: Path) -> None:
+    store = ArchiveStore(tmp_path / "photo_archive.db")
+    downloaded = PhotoRecord(
+        source="wikimedia_commons",
+        source_id="1",
+        search_name="Example",
+        title="First title",
+        page_url="https://example.test/1",
+        image_url="https://example.test/1.jpg",
+        local_path=str(tmp_path / "image.jpg"),
+        sha256="abc",
+        dhash="ff",
+        downloaded_at="2026-01-01T00:00:00+00:00",
+    )
+    refreshed = PhotoRecord(
+        source="wikimedia_commons",
+        source_id="1",
+        search_name="Example",
+        title="Updated title",
+        page_url="https://example.test/1",
+        image_url="https://example.test/1.jpg",
+    )
+
+    store.upsert(downloaded)
+    result = store.upsert(refreshed)
+
+    assert result.title == "Updated title"
+    assert result.local_path == downloaded.local_path
+    assert result.sha256 == "abc"
+
+
+def test_archive_store_preserves_research_content_on_source_refresh(tmp_path: Path) -> None:
+    store = ArchiveStore(tmp_path / "photo_archive.db")
+    original = PhotoRecord(
+        source="website",
+        source_id="research-1",
+        search_name="Example Photographer",
+        title="Original title",
+        collection_title="First series",
+        page_url="https://example.test/series/",
+        image_url="https://example.test/image.jpg",
+    )
+    store.upsert(original)
+
+    edited = store.update_research_content(
+        "website",
+        "research-1",
+        "The use of scale changes the reading of the foreground.",
+        "color，landscape, Color",
+        7,
+    )
+    refreshed = store.upsert(
+        PhotoRecord(
+            source="website",
+            source_id="research-1",
+            search_name="Example Photographer",
+            title="Corrected source title",
+            collection_title="Corrected series",
+            page_url="https://example.test/series/",
+            image_url="https://example.test/image.jpg",
+        )
+    )
+
+    assert edited is not None
+    assert edited.rating == 5
+    assert edited.research_tags == "color, landscape"
+    assert refreshed.title == "Corrected source title"
+    assert refreshed.collection_title == "Corrected series"
+    assert refreshed.research_note.startswith("The use of scale")
+    assert refreshed.research_tags == "color, landscape"
+    assert refreshed.rating == 5
+
+
+def test_archive_store_preserves_latest_research_content_atomically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = ArchiveStore(tmp_path / "photo_archive.db")
+    latest = PhotoRecord(
+        source="website",
+        source_id="atomic-1",
+        search_name="Example Photographer",
+        title="Current title",
+        page_url="https://example.test/work/1",
+        image_url="https://example.test/work/1.jpg",
+        research_note="Latest user note",
+        research_tags="latest",
+        rating=5,
+    )
+    store.upsert(latest)
+    stale = PhotoRecord(
+        source="website",
+        source_id="atomic-1",
+        search_name="Example Photographer",
+        title="Stale title",
+        page_url="https://example.test/work/1",
+        image_url="https://example.test/work/1.jpg",
+    )
+    real_get = store.get_by_source
+    calls = 0
+
+    def stale_then_live(source: str, source_id: str):
+        nonlocal calls
+        calls += 1
+        return stale if calls == 1 else real_get(source, source_id)
+
+    monkeypatch.setattr(store, "get_by_source", stale_then_live)
+    refreshed = store.upsert(
+        PhotoRecord(
+            source="website",
+            source_id="atomic-1",
+            search_name="Example Photographer",
+            title="Refreshed title",
+            page_url="https://example.test/work/1",
+            image_url="https://example.test/work/1.jpg",
+        )
+    )
+
+    assert refreshed.title == "Refreshed title"
+    assert refreshed.research_note == "Latest user note"
+    assert refreshed.research_tags == "latest"
+    assert refreshed.rating == 5
+
+
+def test_archive_store_migrates_existing_database_for_research_fields(tmp_path: Path) -> None:
+    db_path = tmp_path / "photo_archive.db"
+    integer_columns = {"match_confidence", "width", "height", "file_size", "duplicate_distance"}
+    required_columns = {"source", "source_id", "search_name", "title", "page_url", "image_url"}
+    old_columns = [
+        column
+        for column in photo_archive_core.PHOTO_COLUMNS
+        if column not in {"collection_title", "research_note", "research_tags", "rating"}
+    ]
+    definitions = []
+    for column in old_columns:
+        if column in required_columns:
+            definitions.append(f"{column} TEXT NOT NULL")
+        elif column in integer_columns:
+            default = -1 if column == "duplicate_distance" else 0
+            definitions.append(f"{column} INTEGER DEFAULT {default}")
+        else:
+            definitions.append(f"{column} TEXT DEFAULT ''")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            f"CREATE TABLE photos (id INTEGER PRIMARY KEY AUTOINCREMENT, {', '.join(definitions)}, "
+            "UNIQUE(source, source_id))"
+        )
+
+    store = ArchiveStore(db_path)
+    with store.connect() as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(photos)").fetchall()}
+
+    assert {"collection_title", "research_note", "research_tags", "rating"} <= columns
+
+
+def test_research_markdown_contains_source_and_study_content() -> None:
+    record = PhotoRecord(
+        source="website",
+        source_id="1",
+        search_name="Example Photographer",
+        title="A Study Work",
+        collection_title="American Prospects",
+        page_url="https://example.test/work/1",
+        image_url="https://example.test/work/1.jpg",
+        annotation="A roadside scene.",
+        research_note="Observe the relationship between color and distance.",
+        research_tags="color, distance",
+        rating=4,
+    )
+
+    markdown = render_research_markdown(record)
+
+    assert normalize_research_tags(" color，distance, Color ") == "color, distance"
+    assert "# A Study Work" in markdown
+    assert "系列 / 项目：American Prospects" in markdown
+    assert "评分：4/5" in markdown
+    assert "https://example.test/work/1" in markdown
+    assert "Observe the relationship" in markdown
+
+
+def test_archive_store_can_delete_current_search_cache(tmp_path: Path) -> None:
+    store = ArchiveStore(tmp_path / "photo_archive.db")
+    store.upsert(
+        PhotoRecord(
+            source="website",
+            source_id="1",
+            search_name="Wrong Cache",
+            title="Image",
+            page_url="https://example.test/",
+            image_url="https://example.test/image.jpg",
+        )
+    )
+
+    assert store.delete_search("Wrong Cache") == 1
+    assert store.list_records(search_name="Wrong Cache") == []
+
+
+def test_archive_store_lists_saved_photographers_by_recent_activity(tmp_path: Path) -> None:
+    store = ArchiveStore(tmp_path / "photo_archive.db")
+    for source_id, name in (("1", "First Photographer"), ("2", "Second Photographer"), ("3", "First Photographer")):
+        store.upsert(
+            PhotoRecord(
+                source="website",
+                source_id=source_id,
+                search_name=name,
+                title=f"Image {source_id}",
+                page_url="https://example.test/",
+                image_url=f"https://example.test/{source_id}.jpg",
+            )
+        )
+
+    assert store.list_search_names() == [("First Photographer", 2), ("Second Photographer", 1)]

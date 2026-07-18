@@ -1,0 +1,58 @@
+name: Windows build and release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-release.txt
+      - name: Install release dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-release.txt
+      - name: Test and lint
+        run: |
+          python -m pytest -q
+          python -m ruff check .
+          python -m compileall -q photo_archive_app.py photo_archive_cli.py photo_archive_core.py photo_archive_version.py tools tests
+      - name: Audit public source
+        run: python tools/audit_public_source.py .
+      - name: Build and verify Windows package
+        run: python build_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhotographerImageArchive-windows-x64
+          path: |
+            dist/PhotographerImageArchive-*-windows-x64.zip
+            dist/SHA256SUMS-v*.txt
+          if-no-files-found: error
+      - name: Publish tag release without screenshots
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match VERSION $version"
+          }
+          $package = "dist/PhotographerImageArchive-$version-windows-x64.zip"
+          $checksums = "dist/SHA256SUMS-v$version.txt"
+          gh release create $env:GITHUB_REF_NAME `
+            $package `
+            $checksums `
+            --title "Photographer Image Archive $env:GITHUB_REF_NAME" `
+            --notes-file RELEASE_NOTES.md `
+            --verify-tag

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv*/
+build/
+dist/
+*.db
+*.sqlite*
+*.log
+*.part
+photo_archive/
+Photo Archive/
+screenshots/
+docs/review/
