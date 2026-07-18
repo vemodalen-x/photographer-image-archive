@@ -293,6 +293,93 @@ def test_public_request_rejects_private_connected_peer() -> None:
         )
 
 
+def test_public_request_disables_environment_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, object] = {}
+
+    class Response:
+        headers: dict[str, str] = {}
+        status_code = 200
+        url = "https://example.test/data"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    def get(session, _url: str, **kwargs):
+        observed["trust_env"] = session.trust_env
+        observed.update(kwargs)
+        return Response()
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setattr(photo_archive_core.requests.Session, "get", get)
+    session = photo_archive_core.requests.Session()
+    response = photo_archive_core._request_public_response(
+        session,
+        "https://example.test/data",
+        params={"format": "json"},
+        timeout=(5, 10),
+    )
+    photo_archive_core._close_response(response)
+
+    assert observed["trust_env"] is False
+    assert observed["allow_redirects"] is False
+    assert observed["stream"] is True
+    assert observed["params"] == {"format": "json"}
+
+
+def test_public_stream_cancel_closes_a_slow_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = threading.Event()
+    closed = threading.Event()
+    result: dict[str, object] = {}
+
+    class SlowResponse:
+        headers: dict[str, str] = {}
+        status_code = 200
+        url = "https://example.test/slow"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_content(self, _chunk_size: int = 1, **_kwargs):
+            started.set()
+            closed.wait(10)
+            if False:
+                yield b""
+
+        def close(self) -> None:
+            closed.set()
+
+    monkeypatch.setattr(
+        photo_archive_core.requests.Session,
+        "get",
+        lambda *_args, **_kwargs: SlowResponse(),
+    )
+    cancel_event = threading.Event()
+
+    def consume() -> None:
+        try:
+            with photo_archive_core.open_public_stream(
+                "https://example.test/slow",
+                cancel_event=cancel_event,
+                total_timeout=5,
+            ) as response:
+                list(response.iter_content(1))
+        except BaseException as exc:
+            result["error"] = exc
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    assert started.wait(1)
+    cancel_event.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert closed.is_set()
+    assert isinstance(result.get("error"), SearchCancelled)
+
+
 def test_website_parser_bounds_links_and_candidates() -> None:
     parser = photo_archive_core._WebsiteImageParser(
         "https://example.test/",
@@ -892,6 +979,7 @@ def test_browser_renderer_skips_oversized_dom_without_failing_search(tmp_path: P
     class FakeProcess:
         returncode = 0
         stdout = BytesIO(("<html>" + "x" * 80 + "</html>").encode("utf-8"))
+        stderr = BytesIO()
 
         def wait(self, timeout=None):
             return 0
@@ -901,6 +989,7 @@ def test_browser_renderer_skips_oversized_dom_without_failing_search(tmp_path: P
 
     def fake_popen(*args, **kwargs):
         assert kwargs["stdout"] == photo_archive_core.subprocess.PIPE
+        assert kwargs["stderr"] == photo_archive_core.subprocess.PIPE
         return FakeProcess()
 
     monkeypatch.setattr(photo_archive_core.subprocess, "Popen", fake_popen)
@@ -918,6 +1007,40 @@ def test_browser_renderer_skips_oversized_dom_without_failing_search(tmp_path: P
     assert (profile / "rendered-dom.html").stat().st_size == 64
 
 
+def test_browser_renderer_caps_stderr_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    executable = tmp_path / "chrome.exe"
+    executable.touch()
+    profile = tmp_path / "isolated-profile"
+    profile.mkdir()
+
+    class FixedTemporaryDirectory:
+        def __enter__(self):
+            return str(profile)
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeProcess:
+        returncode = 1
+        stdout = BytesIO(b"<html></html>")
+        stderr = BytesIO(b"x" * 256)
+
+        def wait(self, timeout=None):
+            return 1
+
+        def poll(self):
+            return 1
+
+    monkeypatch.setattr(photo_archive_core.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    monkeypatch.setattr(photo_archive_core.tempfile, "TemporaryDirectory", lambda **_kwargs: FixedTemporaryDirectory())
+    monkeypatch.setattr(photo_archive_core, "MAX_RENDERER_LOG_BYTES", 64)
+
+    result = BrowserDOMRenderer(executable=executable).render("https://example.test/gallery")
+
+    assert result == ""
+    assert (profile / "renderer-error.log").stat().st_size == 64
+
+
 def test_discover_official_website_uses_wikidata_official_site() -> None:
     class FakeResponse:
         def __init__(self, data: dict) -> None:
@@ -932,7 +1055,7 @@ def test_discover_official_website_uses_wikidata_official_site() -> None:
     class FakeSession:
         headers: dict[str, str] = {}
 
-        def get(self, _url: str, params: dict, timeout: tuple[int, int]) -> FakeResponse:
+        def get(self, _url: str, params: dict, timeout: tuple[int, int], **_kwargs) -> FakeResponse:
             if params["action"] == "wbsearchentities":
                 return FakeResponse(
                     {
@@ -1007,7 +1130,7 @@ def test_discover_official_website_rejects_non_photographer_namesake() -> None:
     class FakeSession:
         headers: dict[str, str] = {}
 
-        def get(self, _url: str, params: dict, timeout: tuple[int, int]) -> FakeResponse:
+        def get(self, _url: str, params: dict, timeout: tuple[int, int], **_kwargs) -> FakeResponse:
             if params["action"] == "wbsearchentities":
                 return FakeResponse({"search": [{"id": "Q999", "label": "Alex Webb", "description": "business executive"}]})
             return FakeResponse(
@@ -1079,7 +1202,7 @@ def test_commons_source_rejects_general_text_match_without_attribution() -> None
     class FakeSession:
         headers: dict[str, str] = {}
 
-        def get(self, _url: str, params: dict, timeout: tuple[int, int]) -> FakeResponse:
+        def get(self, _url: str, params: dict, timeout: tuple[int, int], **_kwargs) -> FakeResponse:
             return FakeResponse()
 
     events: list[str] = []
@@ -1427,6 +1550,51 @@ def test_download_rolls_back_new_file_when_database_write_fails(tmp_path: Path, 
 
     image_dir = tmp_path / "Example" / "images"
     assert list(image_dir.glob("*")) == []
+
+
+def test_duplicate_database_failure_preserves_preexisting_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if photo_archive_core.Image is None:
+        pytest.skip("Pillow is unavailable")
+    store = ArchiveStore(tmp_path / "photo_archive.db")
+    record = PhotoRecord(
+        source="website",
+        source_id="duplicate-rollback",
+        search_name="Example",
+        title="Preexisting image",
+        page_url="https://example.test/work/preexisting",
+        image_url="https://example.test/work/preexisting.jpg",
+    )
+    image_dir = tmp_path / "Example" / "images"
+    image_dir.mkdir(parents=True)
+    destination = photo_archive_core._destination_for_record(record, image_dir)
+    canonical = tmp_path / "canonical.jpg"
+    for path in (destination, canonical):
+        photo_archive_core.Image.new("RGB", (32, 24), "white").save(path, format="JPEG")
+    exact = PhotoRecord(
+        source="website",
+        source_id="canonical",
+        search_name="Example",
+        title="Canonical image",
+        page_url="https://example.test/work/canonical",
+        image_url="https://example.test/work/canonical.jpg",
+        local_path=str(canonical),
+    )
+
+    monkeypatch.setattr(store, "get_by_sha256", lambda *_args, **_kwargs: exact)
+
+    def fail_update(_record: PhotoRecord) -> PhotoRecord:
+        raise sqlite3.OperationalError("database unavailable")
+
+    monkeypatch.setattr(store, "update_download_state", fail_update)
+
+    with pytest.raises(sqlite3.OperationalError, match="database unavailable"):
+        download_record(record, tmp_path, store)
+
+    assert destination.is_file()
+    assert canonical.is_file()
 
 
 def test_archive_store_preserves_research_content_on_source_refresh(tmp_path: Path) -> None:

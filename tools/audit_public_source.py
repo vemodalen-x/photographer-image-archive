@@ -29,7 +29,7 @@ GENERIC_USER_TEXT_PATH_PATTERNS = (
     re.compile(r"(?i)[A-Z]:(?:\\+|/)Users(?:\\+|/)[A-Za-z0-9._-]+(?:\\+|/)"),
     re.compile(r"(?i)/(?:Users|home)/[A-Za-z0-9._-]+/"),
 )
-WIDE_TEXT_ENCODINGS = ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+WIDE_TEXT_ENCODINGS = (("utf-16-le", 2), ("utf-16-be", 2), ("utf-32-le", 4), ("utf-32-be", 4))
 
 
 class SourceAuditError(RuntimeError):
@@ -51,9 +51,15 @@ def _sensitive_needles() -> tuple[bytes, ...]:
         if not value:
             continue
         needles.add(value.encode("utf-8", errors="ignore"))
-        for encoding in WIDE_TEXT_ENCODINGS:
+        for encoding, _alignment in WIDE_TEXT_ENCODINGS:
             needles.add(value.encode(encoding, errors="ignore"))
     return tuple(needle for needle in needles if needle)
+
+
+def _wide_text_views(data: bytes):
+    for encoding, alignment in WIDE_TEXT_ENCODINGS:
+        for offset in range(alignment):
+            yield data[offset:].decode(encoding, errors="ignore")
 
 
 def audit_source(root: Path) -> list[str]:
@@ -73,15 +79,14 @@ def audit_source(root: Path) -> list[str]:
         if suffix in IMAGE_SUFFIXES and not relative.startswith("assets/photo_archive_icons/"):
             violations.append(f"non-icon image is not allowed in public source: {relative}")
         data = path.read_bytes()
-        wide_text = tuple(data.decode(encoding, errors="ignore") for encoding in WIDE_TEXT_ENCODINGS)
         if (
             any(needle in data for needle in needles)
             or any(pattern.search(data) for pattern in GENERIC_USER_PATH_PATTERNS)
-            or any(pattern.search(text) for text in wide_text for pattern in GENERIC_USER_TEXT_PATH_PATTERNS)
+            or any(pattern.search(text) for text in _wide_text_views(data) for pattern in GENERIC_USER_TEXT_PATH_PATTERNS)
         ):
             violations.append(f"machine-specific home path found: {relative}")
         if any(pattern.search(data) for pattern in SECRET_PATTERNS) or any(
-            pattern.search(text) for text in wide_text for pattern in TEXT_SECRET_PATTERNS
+            pattern.search(text) for text in _wide_text_views(data) for pattern in TEXT_SECRET_PATTERNS
         ):
             violations.append(f"credential-like content found: {relative}")
     return violations

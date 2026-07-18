@@ -56,10 +56,15 @@ MAX_RENDERED_PAGES = 32
 BROWSER_RENDER_TIMEOUT_SECONDS = 28
 BROWSER_VIRTUAL_TIME_BUDGET_MS = 10_000
 MAX_RENDERED_DOM_CHARS = 16 * 1024 * 1024
+MAX_RENDERER_LOG_BYTES = 1024 * 1024
 MAX_IMAGE_DOWNLOAD_BYTES = 512 * 1024 * 1024
 MAX_WEBSITE_HTML_BYTES = 8 * 1024 * 1024
 MAX_ROBOTS_BYTES = 1024 * 1024
 MAX_SITEMAP_BYTES = 8 * 1024 * 1024
+MAX_API_JSON_BYTES = 8 * 1024 * 1024
+MAX_API_TRANSFER_SECONDS = 45
+MAX_WEBSITE_TRANSFER_SECONDS = 45
+MAX_IMAGE_TRANSFER_SECONDS = 300
 MAX_QUEUED_PAGES = 512
 MAX_PAGE_LINKS = 4096
 MAX_PAGE_CANDIDATES = 4096
@@ -168,14 +173,91 @@ def _close_response(response: object) -> None:
         close()
 
 
+class _ResponseTransferGuard:
+    def __init__(
+        self,
+        response: object,
+        *,
+        cancel_event: Optional[Event],
+        total_timeout: float,
+        label: str,
+    ) -> None:
+        self.response = response
+        self.cancel_event = cancel_event
+        self.total_timeout = max(0.1, float(total_timeout))
+        self.label = label
+        self.cancelled = Event()
+        self.timed_out = Event()
+        self._stop = Event()
+        self._thread = Thread(target=self._watch, name="photo-archive-response-watchdog", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1)
+
+    def _watch(self) -> None:
+        deadline = time.monotonic() + self.total_timeout
+        while not self._stop.wait(0.1):
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                self.cancelled.set()
+                _close_response(self.response)
+                return
+            if time.monotonic() >= deadline:
+                self.timed_out.set()
+                _close_response(self.response)
+                return
+
+    def raise_if_interrupted(self) -> None:
+        if self.cancelled.is_set():
+            raise SearchCancelled("Search cancelled by user.")
+        if self.timed_out.is_set():
+            raise PhotoArchiveError(f"{self.label} exceeded the {self.total_timeout:g}s transfer time limit")
+
+
+@contextmanager
+def _guard_response_transfer(
+    response: object,
+    *,
+    cancel_event: Optional[Event],
+    total_timeout: float,
+    label: str,
+):
+    guard = _ResponseTransferGuard(
+        response,
+        cancel_event=cancel_event,
+        total_timeout=total_timeout,
+        label=label,
+    )
+    guard.start()
+    try:
+        try:
+            yield response
+        except BaseException as exc:
+            if guard.cancelled.is_set():
+                raise SearchCancelled("Search cancelled by user.") from exc
+            if guard.timed_out.is_set():
+                raise PhotoArchiveError(
+                    f"{label} exceeded the {float(total_timeout):g}s transfer time limit"
+                ) from exc
+            raise
+        guard.raise_if_interrupted()
+    finally:
+        guard.stop()
+
+
 def _request_public_response(
     session: requests.Session,
     url: str,
     *,
     timeout: tuple[int, int],
     headers: Optional[dict[str, str]] = None,
+    params: Optional[dict[str, object]] = None,
     expected_host: str = "",
     label: str = "Network request",
+    allowed_statuses: Optional[set[int]] = None,
 ) -> object:
     if isinstance(session, requests.Session):
         session.trust_env = False
@@ -187,6 +269,7 @@ def _request_public_response(
         response = session.get(
             current_url,
             headers=headers,
+            params=params if redirect_count == 0 else None,
             timeout=timeout,
             stream=True,
             allow_redirects=False,
@@ -204,7 +287,8 @@ def _request_public_response(
                 _close_response(response)
                 current_url = next_url
                 continue
-            response.raise_for_status()
+            if status_code not in (allowed_statuses or set()):
+                response.raise_for_status()
             final_url = str(getattr(response, "url", "") or current_url)
             final_host, _addresses = _validate_public_url(final_url)
             if expected_host and not _same_site_host(final_host, expected_host):
@@ -223,13 +307,66 @@ def open_public_stream(
     headers: Optional[dict[str, str]] = None,
     timeout: tuple[int, int] = (10, 60),
     label: str = "Image request",
+    cancel_event: Optional[Event] = None,
+    total_timeout: float = MAX_IMAGE_TRANSFER_SECONDS,
 ):
     with requests.Session() as session:
         response = _request_public_response(session, url, headers=headers, timeout=timeout, label=label)
         try:
-            yield response
+            with _guard_response_transfer(
+                response,
+                cancel_event=cancel_event,
+                total_timeout=total_timeout,
+                label=label,
+            ):
+                yield response
         finally:
             _close_response(response)
+
+
+def _response_json(response: object, label: str) -> dict:
+    if not isinstance(response, requests.Response) and not callable(getattr(response, "iter_content", None)):
+        data = response.json()
+    else:
+        content = _bounded_response_content(response, MAX_API_JSON_BYTES, label)
+        encoding = getattr(response, "encoding", None) or "utf-8"
+        try:
+            data = json.loads(content.decode(encoding, errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PhotoArchiveError(f"{label} returned invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise PhotoArchiveError(f"{label} returned an unexpected JSON document")
+    return data
+
+
+def _request_public_json(
+    session: requests.Session,
+    url: str,
+    *,
+    params: dict[str, object],
+    timeout: tuple[int, int],
+    cancel_event: Optional[Event],
+    label: str,
+) -> dict:
+    expected_host = urlparse(url).hostname or ""
+    response = _request_public_response(
+        session,
+        url,
+        params=params,
+        timeout=timeout,
+        expected_host=expected_host,
+        label=label,
+    )
+    try:
+        with _guard_response_transfer(
+            response,
+            cancel_event=cancel_event,
+            total_timeout=MAX_API_TRANSFER_SECONDS,
+            label=label,
+        ):
+            return _response_json(response, label)
+    finally:
+        _close_response(response)
 
 
 @dataclass
@@ -706,12 +843,15 @@ def discover_official_website(
 
     session = session or requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
+    if isinstance(session, requests.Session):
+        session.trust_env = False
     _emit(callback, "official_site_search", message=f"Looking up official website for {search_name}")
     candidates: dict[str, dict] = {}
     for language in ("zh", "en", "ja", "fr", "de"):
         _check_cancel(cancel_event)
         try:
-            response = session.get(
+            data = _request_public_json(
+                session,
                 WIKIDATA_API_URL,
                 params={
                     "action": "wbsearchentities",
@@ -722,15 +862,18 @@ def discover_official_website(
                     "limit": 5,
                 },
                 timeout=(8, 20),
+                cancel_event=cancel_event,
+                label=f"Wikidata official-site lookup ({language})",
             )
-            response.raise_for_status()
-            for item in response.json().get("search", []):
+            for item in data.get("search", []):
                 entity_id = item.get("id")
                 if not entity_id:
                     continue
                 current = candidates.setdefault(entity_id, {"id": entity_id, "labels": [], "descriptions": []})
                 current["labels"].append(str(item.get("label") or ""))
                 current["descriptions"].append(str(item.get("description") or ""))
+        except SearchCancelled:
+            raise
         except Exception as exc:
             _emit(callback, "source_retry", message=f"Official-site lookup failed for {language}: {exc}")
 
@@ -740,7 +883,8 @@ def discover_official_website(
 
     _check_cancel(cancel_event)
     try:
-        response = session.get(
+        data = _request_public_json(
+            session,
             WIKIDATA_API_URL,
             params={
                 "action": "wbgetentities",
@@ -750,9 +894,12 @@ def discover_official_website(
                 "languages": "zh|en|ja|fr|de",
             },
             timeout=(8, 20),
+            cancel_event=cancel_event,
+            label="Wikidata official-site details",
         )
-        response.raise_for_status()
-        entities = response.json().get("entities", {})
+        entities = data.get("entities", {})
+    except SearchCancelled:
+        raise
     except Exception as exc:
         _emit(callback, "official_site_missing", message=f"Could not read official website data: {exc}")
         return ""
@@ -984,85 +1131,108 @@ class BrowserDOMRenderer:
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             dom_path = Path(profile) / "rendered-dom.html"
             error_path = Path(profile) / "renderer-error.log"
-            with error_path.open("wb") as error_handle:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=creationflags,
+                )
+            except OSError as exc:
+                _emit(callback, "source_notice", message=f"Dynamic renderer unavailable: {exc}")
+                return ""
+
+            limit_exceeded = Event()
+            reader_errors: list[Exception] = []
+
+            def capture_stdout() -> None:
+                total = 0
                 try:
-                    process = subprocess.Popen(
-                        command,
-                        stdout=subprocess.PIPE,
-                        stderr=error_handle,
-                        creationflags=creationflags,
-                    )
-                except OSError as exc:
-                    _emit(callback, "source_notice", message=f"Dynamic renderer unavailable: {exc}")
-                    return ""
+                    if process.stdout is None:
+                        return
+                    with dom_path.open("wb") as dom_handle:
+                        while True:
+                            chunk = process.stdout.read(256 * 1024)
+                            if not chunk:
+                                break
+                            remaining = MAX_RENDERED_DOM_CHARS - total
+                            if len(chunk) > remaining:
+                                if remaining > 0:
+                                    dom_handle.write(chunk[:remaining])
+                                limit_exceeded.set()
+                                break
+                            dom_handle.write(chunk)
+                            total += len(chunk)
+                except Exception as exc:
+                    reader_errors.append(exc)
 
-                limit_exceeded = Event()
-                reader_errors: list[Exception] = []
+            def capture_stderr() -> None:
+                written = 0
+                try:
+                    if process.stderr is None:
+                        return
+                    with error_path.open("wb") as error_handle:
+                        while True:
+                            chunk = process.stderr.read(64 * 1024)
+                            if not chunk:
+                                break
+                            remaining = MAX_RENDERER_LOG_BYTES - written
+                            if remaining > 0:
+                                payload = chunk[:remaining]
+                                error_handle.write(payload)
+                                written += len(payload)
+                except Exception as exc:
+                    reader_errors.append(exc)
 
-                def capture_stdout() -> None:
-                    total = 0
-                    try:
-                        if process.stdout is None:
-                            return
-                        with dom_path.open("wb") as dom_handle:
-                            while True:
-                                chunk = process.stdout.read(256 * 1024)
-                                if not chunk:
-                                    break
-                                remaining = MAX_RENDERED_DOM_CHARS - total
-                                if len(chunk) > remaining:
-                                    if remaining > 0:
-                                        dom_handle.write(chunk[:remaining])
-                                    limit_exceeded.set()
-                                    break
-                                dom_handle.write(chunk)
-                                total += len(chunk)
-                    except Exception as exc:
-                        reader_errors.append(exc)
+            stdout_reader = Thread(target=capture_stdout, name="photo-archive-dom-reader", daemon=True)
+            stderr_reader = Thread(target=capture_stderr, name="photo-archive-log-reader", daemon=True)
+            stdout_reader.start()
+            stderr_reader.start()
 
-                reader = Thread(target=capture_stdout, name="photo-archive-dom-reader", daemon=True)
-                reader.start()
+            def join_readers() -> None:
+                stdout_reader.join(timeout=2)
+                stderr_reader.join(timeout=2)
 
-                deadline = time.monotonic() + BROWSER_RENDER_TIMEOUT_SECONDS
-                while True:
-                    if limit_exceeded.is_set():
-                        _terminate_process(process)
-                        reader.join(timeout=2)
-                        _emit(
-                            callback,
-                            "source_notice",
-                            message=f"Dynamic page exceeded the {MAX_RENDERED_DOM_CHARS // (1024 * 1024)} MB DOM limit and was skipped: {url}",
-                        )
-                        return ""
-                    try:
-                        process.wait(timeout=0.2)
-                        break
-                    except subprocess.TimeoutExpired:
-                        if cancel_event is not None and cancel_event.is_set():
-                            _terminate_process(process)
-                            reader.join(timeout=2)
-                            raise SearchCancelled("Search cancelled by user.")
-                        if time.monotonic() >= deadline:
-                            _terminate_process(process)
-                            reader.join(timeout=2)
-                            _emit(callback, "source_notice", message=f"Dynamic rendering timed out: {url}")
-                            return ""
-
-                reader.join(timeout=2)
-                if reader.is_alive():
-                    _terminate_process(process)
-                    _emit(callback, "source_notice", message=f"Dynamic rendering output did not close: {url}")
-                    return ""
-                if reader_errors:
-                    _emit(callback, "source_notice", message=f"Dynamic rendering output failed: {reader_errors[0]}")
-                    return ""
+            deadline = time.monotonic() + BROWSER_RENDER_TIMEOUT_SECONDS
+            while True:
                 if limit_exceeded.is_set():
+                    _terminate_process(process)
+                    join_readers()
                     _emit(
                         callback,
                         "source_notice",
                         message=f"Dynamic page exceeded the {MAX_RENDERED_DOM_CHARS // (1024 * 1024)} MB DOM limit and was skipped: {url}",
                     )
                     return ""
+                try:
+                    process.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if cancel_event is not None and cancel_event.is_set():
+                        _terminate_process(process)
+                        join_readers()
+                        raise SearchCancelled("Search cancelled by user.")
+                    if time.monotonic() >= deadline:
+                        _terminate_process(process)
+                        join_readers()
+                        _emit(callback, "source_notice", message=f"Dynamic rendering timed out: {url}")
+                        return ""
+
+            join_readers()
+            if stdout_reader.is_alive() or stderr_reader.is_alive():
+                _terminate_process(process)
+                _emit(callback, "source_notice", message=f"Dynamic rendering output did not close: {url}")
+                return ""
+            if reader_errors:
+                _emit(callback, "source_notice", message=f"Dynamic rendering output failed: {reader_errors[0]}")
+                return ""
+            if limit_exceeded.is_set():
+                _emit(
+                    callback,
+                    "source_notice",
+                    message=f"Dynamic page exceeded the {MAX_RENDERED_DOM_CHARS // (1024 * 1024)} MB DOM limit and was skipped: {url}",
+                )
+                return ""
 
             if process.returncode != 0:
                 detail = html_to_text(error_path.read_bytes()[-4096:].decode("utf-8", errors="replace"))[-240:]
@@ -1082,6 +1252,8 @@ class WebsiteImageSource:
     ) -> None:
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
+        if isinstance(self.session, requests.Session):
+            self.session.trust_env = False
         self.renderer = renderer or BrowserDOMRenderer()
 
     def search(
@@ -1169,7 +1341,9 @@ class WebsiteImageSource:
                 target=limit,
             )
             try:
-                text = self._fetch_html(page_url, start_host)
+                text = self._fetch_html(page_url, start_host, cancel_event=cancel_event)
+            except SearchCancelled:
+                raise
             except Exception as exc:
                 page_errors += 1
                 _emit(callback, "source_error", source=self.source_name, message=f"{page_url}: {exc}")
@@ -1368,6 +1542,7 @@ class WebsiteImageSource:
                 max_bytes=MAX_ROBOTS_BYTES,
                 expected_host=parsed.netloc.lower(),
                 label="robots.txt",
+                cancel_event=cancel_event,
             )
             lines = content.decode(getattr(response, "encoding", None) or "utf-8", errors="replace").splitlines()
             parser.parse(lines)
@@ -1375,6 +1550,8 @@ class WebsiteImageSource:
                 key, separator, value = line.partition(":")
                 if separator and key.strip().casefold() == "sitemap" and value.strip():
                     sitemap_urls.append(urljoin(start_url, value.strip()))
+        except SearchCancelled:
+            raise
         except Exception as exc:
             parser.parse([])
             _emit(callback, "source_notice", message=f"Site policy unavailable; continuing with public pages: {exc}")
@@ -1404,8 +1581,11 @@ class WebsiteImageSource:
                     max_bytes=MAX_SITEMAP_BYTES,
                     expected_host=start_host,
                     label="sitemap",
+                    cancel_event=cancel_event,
                 )
                 root = ET.fromstring(content)
+            except SearchCancelled:
+                raise
             except Exception as exc:
                 _emit(callback, "source_notice", message=f"Skipped sitemap {sitemap_url}: {exc}")
                 continue
@@ -1426,6 +1606,7 @@ class WebsiteImageSource:
         max_bytes: int,
         expected_host: str,
         label: str,
+        cancel_event: Optional[Event] = None,
     ):
         response = _request_public_response(
             self.session,
@@ -1435,12 +1616,23 @@ class WebsiteImageSource:
             label=label,
         )
         try:
-            content = _bounded_response_content(response, max_bytes, label)
+            with _guard_response_transfer(
+                response,
+                cancel_event=cancel_event,
+                total_timeout=MAX_WEBSITE_TRANSFER_SECONDS,
+                label=label,
+            ):
+                content = _bounded_response_content(response, max_bytes, label)
             return response, content
         finally:
             _close_response(response)
 
-    def _fetch_html(self, url: str, start_host: str = "") -> str:
+    def _fetch_html(
+        self,
+        url: str,
+        start_host: str = "",
+        cancel_event: Optional[Event] = None,
+    ) -> str:
         start_host = start_host or urlparse(url).netloc.lower()
         response, content = self._bounded_get(
             url,
@@ -1448,6 +1640,7 @@ class WebsiteImageSource:
             max_bytes=MAX_WEBSITE_HTML_BYTES,
             expected_host=start_host,
             label="HTML page",
+            cancel_event=cancel_event,
         )
         content_type = response.headers.get("Content-Type", "").lower()
         if content_type and "html" not in content_type:
@@ -1656,6 +1849,8 @@ class WikimediaCommonsSource:
     def __init__(self, session: Optional[requests.Session] = None) -> None:
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
+        if isinstance(self.session, requests.Session):
+            self.session.trust_env = False
 
     def search(
         self,
@@ -1711,6 +1906,8 @@ class WikimediaCommonsSource:
                     callback,
                     cancel_event=cancel_event,
                 )
+            except SearchCancelled:
+                raise
             except Exception as exc:
                 _emit(callback, "source_error", source=self.source_name, message=str(exc))
                 break
@@ -2183,17 +2380,22 @@ def download_record(
         if exact and Path(exact.local_path).is_file():
             record.duplicate_of = exact.source_key
             record.local_path = exact.local_path
+            redundant_path: Optional[Path] = None
             if downloaded_part:
-                part_path.unlink(missing_ok=True)
-                downloaded_part = False
+                redundant_path = part_path
             else:
                 try:
                     if destination.exists() and Path(exact.local_path).resolve() != destination.resolve():
-                        destination.unlink()
+                        redundant_path = destination
                 except OSError:
                     pass
             _emit(callback, "duplicate", title=record.title, duplicate_of=exact.title, kind="exact")
-            return store.update_download_state(record)
+            saved = store.update_download_state(record)
+            if redundant_path is not None:
+                redundant_path.unlink(missing_ok=True)
+                if redundant_path == part_path:
+                    downloaded_part = False
+            return saved
 
         near = find_near_duplicate(
             record,
@@ -2689,15 +2891,30 @@ def _get_json_with_retries(
     last_error: Optional[Exception] = None
     for attempt in range(API_RETRIES + 1):
         _check_cancel(cancel_event)
+        response = None
         try:
-            response = session.get(url, params=params, timeout=(8, 25))
+            response = _request_public_response(
+                session,
+                url,
+                params=params,
+                timeout=(8, 25),
+                expected_host=urlparse(url).hostname or "",
+                label="Wikimedia API request",
+                allowed_statuses={429, 503},
+            )
             retry_after = _safe_int(response.headers.get("Retry-After"))
             if response.status_code in {429, 503} and retry_after:
                 _emit(callback, "source_retry", message=f"Server asked to retry after {retry_after}s.", retry_after=retry_after)
                 _wait_or_cancel(cancel_event, min(10, max(1, retry_after)))
                 continue
             response.raise_for_status()
-            data = response.json()
+            with _guard_response_transfer(
+                response,
+                cancel_event=cancel_event,
+                total_timeout=MAX_API_TRANSFER_SECONDS,
+                label="Wikimedia API request",
+            ):
+                data = _response_json(response, "Wikimedia API request")
             error = data.get("error") if isinstance(data, dict) else None
             if isinstance(error, dict) and error.get("code") == "maxlag":
                 retry_after = _safe_int(response.headers.get("Retry-After")) or 5
@@ -2714,6 +2931,9 @@ def _get_json_with_retries(
             wait_seconds = 1 + attempt * 2
             _emit(callback, "source_retry", message=f"Network request failed; retrying in {wait_seconds}s: {exc}", retry_after=wait_seconds)
             _wait_or_cancel(cancel_event, wait_seconds)
+        finally:
+            if response is not None:
+                _close_response(response)
     raise last_error or PhotoArchiveError("API request failed.")
 
 
@@ -2726,7 +2946,14 @@ def _download_binary(
 ) -> None:
     headers = {"User-Agent": USER_AGENT, "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"}
     try:
-        with open_public_stream(url, headers=headers, timeout=(10, 60), label="Image download") as response:
+        with open_public_stream(
+            url,
+            headers=headers,
+            timeout=(10, 60),
+            label="Image download",
+            cancel_event=cancel_event,
+            total_timeout=MAX_IMAGE_TRANSFER_SECONDS,
+        ) as response:
             response.raise_for_status()
             total = _safe_int(response.headers.get("Content-Length"))
             if total > MAX_IMAGE_DOWNLOAD_BYTES:

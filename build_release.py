@@ -26,6 +26,15 @@ def _remove_generated(path: Path) -> None:
         shutil.rmtree(resolved)
 
 
+def _release_entry_bytes(path: Path, source_dir: Path) -> bytes:
+    relative = path.relative_to(source_dir)
+    data = path.read_bytes()
+    if relative.name in PUBLIC_DOCUMENTS or relative.parts[:1] == ("THIRD_PARTY_LICENSES",):
+        text = data.decode("utf-8")
+        return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+    return data
+
+
 def _write_deterministic_zip(source_dir: Path, destination: Path) -> None:
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for path in sorted(item for item in source_dir.rglob("*") if item.is_file()):
@@ -33,7 +42,12 @@ def _write_deterministic_zip(source_dir: Path, destination: Path) -> None:
             info = zipfile.ZipInfo(relative.as_posix(), date_time=(2026, 7, 18, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o100644 << 16
-            archive.writestr(info, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+            archive.writestr(
+                info,
+                _release_entry_bytes(path, source_dir),
+                compress_type=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+            )
 
 
 def build() -> tuple[Path, Path]:
@@ -52,6 +66,9 @@ def build() -> tuple[Path, Path]:
 
     env = os.environ.copy()
     env.update({"PYTHONHASHSEED": "0", "SOURCE_DATE_EPOCH": "1784332800"})
+    conda_runtime_bin = Path(sys.prefix) / "Library" / "bin"
+    if conda_runtime_bin.is_dir():
+        env["PATH"] = os.pathsep.join((str(conda_runtime_bin), env.get("PATH", "")))
     subprocess.run(
         [
             sys.executable,

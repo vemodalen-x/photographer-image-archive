@@ -42,11 +42,12 @@ TEXT_SECRET_PATTERNS = (
     re.compile(r"ghp_[A-Za-z0-9]{20,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
 )
-WIDE_TEXT_ENCODINGS = ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+WIDE_TEXT_ENCODINGS = (("utf-16-le", 2), ("utf-16-be", 2), ("utf-32-le", 4), ("utf-32-be", 4))
 THIRD_PARTY_LICENSE_FILES = {
     "BZIP2.txt",
     "CERTIFI.txt",
     "CHARSET_NORMALIZER.txt",
+    "EXPAT.txt",
     "IDNA.txt",
     "LIBFFI.txt",
     "LUCIDE.txt",
@@ -58,6 +59,7 @@ THIRD_PARTY_LICENSE_FILES = {
     "REQUESTS.txt",
     "SQLITE.txt",
     "TCL-TK.txt",
+    "TYPING_EXTENSIONS.txt",
     "URLLIB3.txt",
     "XZ.txt",
     "ZLIB.txt",
@@ -74,6 +76,12 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _wide_text_views(data: bytes):
+    for encoding, alignment in WIDE_TEXT_ENCODINGS:
+        for offset in range(alignment):
+            yield data[offset:].decode(encoding, errors="ignore")
 
 
 def _expected_entries(version: str) -> set[str]:
@@ -100,13 +108,14 @@ def _check_entry_name(name: str) -> None:
 
 
 def _check_content(name: str, data: bytes) -> None:
-    wide_text = tuple(data.decode(encoding, errors="ignore") for encoding in WIDE_TEXT_ENCODINGS)
+    if not name.endswith("/PhotographerImageArchive.exe") and b"\r" in data:
+        raise ReleaseVerificationError(f"non-canonical text line endings in {name}")
     if any(pattern.search(data) for pattern in PATH_PATTERNS) or any(
-        pattern.search(text) for text in wide_text for pattern in TEXT_PATH_PATTERNS
+        pattern.search(text) for text in _wide_text_views(data) for pattern in TEXT_PATH_PATTERNS
     ):
         raise ReleaseVerificationError(f"absolute user path embedded in {name}")
     if any(pattern.search(data) for pattern in SECRET_PATTERNS) or any(
-        pattern.search(text) for text in wide_text for pattern in TEXT_SECRET_PATTERNS
+        pattern.search(text) for text in _wide_text_views(data) for pattern in TEXT_SECRET_PATTERNS
     ):
         raise ReleaseVerificationError(f"credential-like content embedded in {name}")
 

@@ -35,8 +35,8 @@ jobs:
         with:
           name: PhotographerImageArchive-windows-x64
           path: |
-            dist/PhotographerImageArchive-*-windows-x64.zip
-            dist/SHA256SUMS-v*.txt
+            dist/PhotographerImageArchive-1.0.0-windows-x64.zip
+            dist/SHA256SUMS-v1.0.0.txt
           if-no-files-found: error
 
   publish-release:

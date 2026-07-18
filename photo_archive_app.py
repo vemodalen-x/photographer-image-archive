@@ -51,6 +51,7 @@ MAX_STUDY_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_STUDY_CACHE_BYTES = 128 * 1024 * 1024
 MAX_STUDY_CACHE_ITEMS = 8
 MAX_STUDY_DECODE_PIXELS = 24_000_000
+BACKGROUND_SHUTDOWN_GRACE_SECONDS = 15
 GALLERY_CARD_WIDTH = 252
 GALLERY_CARD_HEIGHT = 220
 GALLERY_GAP = 12
@@ -2096,6 +2097,8 @@ class PhotoArchiveApp(tk.Tk):
                     headers={"User-Agent": "PhotoArchiveTool/0.1"},
                     timeout=(5, 12),
                     label="Thumbnail request",
+                    cancel_event=self.shutdown_event,
+                    total_timeout=30,
                 ) as response:
                     response.raise_for_status()
                     declared_size = int(response.headers.get("Content-Length") or 0)
@@ -2222,6 +2225,8 @@ class PhotoArchiveApp(tk.Tk):
             headers={"User-Agent": "PhotoArchiveTool/0.1"},
             timeout=(6, 20),
             label="Study preview request",
+            cancel_event=self.shutdown_event,
+            total_timeout=45,
         ) as response:
             response.raise_for_status()
             declared_size = int(response.headers.get("Content-Length") or 0)
@@ -2314,6 +2319,8 @@ class PhotoArchiveApp(tk.Tk):
         failed = 0
         try:
             for index, record in enumerate(records, start=1):
+                if self.shutdown_event.is_set():
+                    raise SearchCancelled("application is closing")
                 content = self._get_cached_study_image(record.source_key)
                 if content is None:
                     try:
@@ -2394,6 +2401,8 @@ class PhotoArchiveApp(tk.Tk):
                 headers={"User-Agent": "PhotoArchiveTool/0.1"},
                 timeout=(5, 12),
                 label="Preview request",
+                cancel_event=self.shutdown_event,
+                total_timeout=30,
             ) as response:
                 response.raise_for_status()
                 chunks: list[bytes] = []
@@ -2609,11 +2618,20 @@ class PhotoArchiveApp(tk.Tk):
         self.shutdown_thread.start()
 
     def _wait_for_background_shutdown(self) -> None:
+        deadline = time.monotonic() + BACKGROUND_SHUTDOWN_GRACE_SECONDS
         worker = self.worker_thread
         if worker is not None and worker.is_alive() and worker is not threading.current_thread():
-            worker.join()
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
         for executor in (self.thumbnail_executor, self.preview_executor, self.study_executor):
-            executor.shutdown(wait=True, cancel_futures=True)
+            executor.shutdown(wait=False, cancel_futures=True)
+        background_prefixes = ("photo-thumb", "photo-preview", "photo-study")
+        for thread in list(threading.enumerate()):
+            if thread is threading.current_thread() or not thread.name.startswith(background_prefixes):
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
         self.ui_queue.put(("shutdown_complete", {}))
 
     def _log(self, message: str) -> None:
