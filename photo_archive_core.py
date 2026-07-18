@@ -4,11 +4,13 @@ import datetime as dt
 import hashlib
 import heapq
 import html
+import ipaddress
 import json
 import mimetypes
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import tempfile
@@ -17,6 +19,7 @@ import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from threading import Event, Thread
@@ -98,6 +101,135 @@ class PhotoArchiveError(Exception):
 
 class SearchCancelled(PhotoArchiveError):
     """Raised when a caller requests a clean stop of discovery or download."""
+
+
+def _public_ip_address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    try:
+        address = ipaddress.ip_address(value.split("%", 1)[0])
+    except ValueError as exc:
+        raise PhotoArchiveError(f"Network destination did not resolve to a valid IP address: {value}") from exc
+    if not address.is_global:
+        raise PhotoArchiveError(f"Private or non-public network destination is blocked: {address}")
+    return address
+
+
+def _resolve_public_addresses(host: str) -> tuple[str, ...]:
+    host = host.strip().strip("[]").rstrip(".")
+    if not host:
+        raise PhotoArchiveError("Network destination has no host name.")
+    try:
+        return (str(_public_ip_address(host)),)
+    except PhotoArchiveError:
+        try:
+            ipaddress.ip_address(host.split("%", 1)[0])
+        except ValueError:
+            pass
+        else:
+            raise
+
+    try:
+        resolved = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise PhotoArchiveError(f"Could not resolve public network destination {host}: {exc}") from exc
+    addresses = {str(_public_ip_address(str(item[4][0]))) for item in resolved if item[4]}
+    if not addresses:
+        raise PhotoArchiveError(f"Network destination did not resolve: {host}")
+    return tuple(sorted(addresses, key=lambda value: (ipaddress.ip_address(value).version, value)))
+
+
+def _validate_public_url(url: str) -> tuple[str, tuple[str, ...]]:
+    parsed = urlparse(url)
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+        raise PhotoArchiveError(f"Only public HTTP(S) URLs are supported: {url}")
+    if parsed.username is not None or parsed.password is not None:
+        raise PhotoArchiveError("Network URLs containing credentials are blocked.")
+    host = parsed.hostname.casefold().rstrip(".")
+    return host, _resolve_public_addresses(host)
+
+
+def _validate_response_peer(response: object) -> None:
+    if not isinstance(response, requests.Response):
+        return
+    raw = getattr(response, "raw", None)
+    connection = getattr(raw, "_connection", None) or getattr(raw, "connection", None)
+    sock = getattr(connection, "sock", None)
+    if sock is None:
+        raise PhotoArchiveError("Could not verify the network peer for a public request.")
+    try:
+        peer_ip = str(sock.getpeername()[0])
+    except (OSError, TypeError, IndexError) as exc:
+        raise PhotoArchiveError("Could not verify the network peer for a public request.") from exc
+    _public_ip_address(peer_ip)
+
+
+def _close_response(response: object) -> None:
+    close = getattr(response, "close", None)
+    if callable(close):
+        close()
+
+
+def _request_public_response(
+    session: requests.Session,
+    url: str,
+    *,
+    timeout: tuple[int, int],
+    headers: Optional[dict[str, str]] = None,
+    expected_host: str = "",
+    label: str = "Network request",
+) -> object:
+    if isinstance(session, requests.Session):
+        session.trust_env = False
+    current_url = url
+    for redirect_count in range(MAX_SAME_SITE_REDIRECTS + 1):
+        current_host, _addresses = _validate_public_url(current_url)
+        if expected_host and not _same_site_host(current_host, expected_host):
+            raise PhotoArchiveError(f"{label} redirected outside the official site: {current_url}")
+        response = session.get(
+            current_url,
+            headers=headers,
+            timeout=timeout,
+            stream=True,
+            allow_redirects=False,
+        )
+        try:
+            _validate_response_peer(response)
+            status_code = int(getattr(response, "status_code", 200) or 200)
+            if status_code in {301, 302, 303, 307, 308}:
+                location = str(response.headers.get("Location", "")).strip()
+                if not location:
+                    raise PhotoArchiveError(f"{label} returned a redirect without a location")
+                if redirect_count >= MAX_SAME_SITE_REDIRECTS:
+                    raise PhotoArchiveError(f"{label} exceeded the redirect limit")
+                next_url = urljoin(current_url, location)
+                _close_response(response)
+                current_url = next_url
+                continue
+            response.raise_for_status()
+            final_url = str(getattr(response, "url", "") or current_url)
+            final_host, _addresses = _validate_public_url(final_url)
+            if expected_host and not _same_site_host(final_host, expected_host):
+                raise PhotoArchiveError(f"{label} redirected outside the official site: {final_url}")
+            return response
+        except Exception:
+            _close_response(response)
+            raise
+    raise PhotoArchiveError(f"{label} exceeded the redirect limit")
+
+
+@contextmanager
+def open_public_stream(
+    url: str,
+    *,
+    headers: Optional[dict[str, str]] = None,
+    timeout: tuple[int, int] = (10, 60),
+    label: str = "Image request",
+):
+    with requests.Session() as session:
+        response = _request_public_response(session, url, headers=headers, timeout=timeout, label=label)
+        try:
+            yield response
+        finally:
+            _close_response(response)
 
 
 @dataclass
@@ -365,6 +497,30 @@ PHOTO_COLUMNS = [
     "duplicate_distance",
     "downloaded_at",
 ]
+RESEARCH_COLUMNS = {"research_note", "research_tags", "rating"}
+DOWNLOAD_STATE_COLUMNS = {
+    "local_path",
+    "sha256",
+    "dhash",
+    "duplicate_of",
+    "near_duplicate_of",
+    "duplicate_distance",
+    "downloaded_at",
+}
+DOWNLOAD_DERIVED_COLUMNS = DOWNLOAD_STATE_COLUMNS | {
+    "width",
+    "height",
+    "mime",
+    "file_size",
+    "shooting_date",
+    "camera_make",
+    "camera_model",
+    "lens_model",
+    "exposure_time",
+    "f_number",
+    "iso",
+    "focal_length",
+}
 
 
 def archive_photographer(
@@ -712,6 +868,65 @@ def _terminate_process(process) -> None:
         process.wait()
 
 
+class _DenyProxyHandler(BaseHTTPRequestHandler):
+    def _deny(self) -> None:
+        self.send_response(403)
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    do_CONNECT = _deny
+    do_DELETE = _deny
+    do_GET = _deny
+    do_HEAD = _deny
+    do_OPTIONS = _deny
+    do_PATCH = _deny
+    do_POST = _deny
+    do_PUT = _deny
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class _DenyProxyServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+
+@contextmanager
+def _deny_proxy():
+    server = _DenyProxyServer(("127.0.0.1", 0), _DenyProxyHandler)
+    thread = Thread(target=server.serve_forever, name="photo-archive-deny-proxy")
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def _chromium_network_arguments(url: str, deny_proxy_url: str) -> list[str]:
+    host, addresses = _validate_public_url(url)
+    allowed: dict[str, tuple[str, ...]] = {host: addresses}
+    alternate = host.removeprefix("www.") if host.startswith("www.") else f"www.{host}"
+    try:
+        allowed[alternate] = _resolve_public_addresses(alternate)
+    except PhotoArchiveError:
+        pass
+
+    resolver_rules: list[str] = []
+    for allowed_host, resolved in sorted(allowed.items()):
+        address = resolved[0]
+        mapped = f"[{address}]" if ipaddress.ip_address(address).version == 6 else address
+        resolver_rules.append(f"MAP {allowed_host} {mapped}")
+    resolver_rules.append("MAP * ~NOTFOUND")
+    bypass = ";".join(["<-loopback>", *sorted(allowed)])
+    return [
+        f"--proxy-server={deny_proxy_url}",
+        f"--proxy-bypass-list={bypass}",
+        f"--host-resolver-rules={', '.join(resolver_rules)}",
+    ]
+
+
 class BrowserDOMRenderer:
     """Render public JavaScript pages in an isolated local Chromium profile.
 
@@ -727,7 +942,7 @@ class BrowserDOMRenderer:
     def available(self) -> bool:
         return bool(self.executable and self.executable.exists())
 
-    def build_command(self, profile_dir: Path, url: str) -> list[str]:
+    def build_command(self, profile_dir: Path, url: str, deny_proxy_url: str) -> list[str]:
         if not self.executable:
             return []
         return [
@@ -743,6 +958,7 @@ class BrowserDOMRenderer:
             "--no-default-browser-check",
             f"--user-data-dir={profile_dir}",
             f"--virtual-time-budget={BROWSER_VIRTUAL_TIME_BUDGET_MS}",
+            *_chromium_network_arguments(url, deny_proxy_url),
             "--dump-dom",
             url,
         ]
@@ -757,8 +973,14 @@ class BrowserDOMRenderer:
             return ""
         _check_cancel(cancel_event)
         _emit(callback, "source_render", message=f"Rendering dynamic public page: {url}", url=url)
-        with tempfile.TemporaryDirectory(prefix="photo_archive_browser_", ignore_cleanup_errors=True) as profile:
-            command = self.build_command(Path(profile), url)
+        with _deny_proxy() as deny_proxy_url, tempfile.TemporaryDirectory(
+            prefix="photo_archive_browser_", ignore_cleanup_errors=True
+        ) as profile:
+            try:
+                command = self.build_command(Path(profile), url, deny_proxy_url)
+            except PhotoArchiveError as exc:
+                _emit(callback, "source_blocked", message=str(exc), url=url)
+                return ""
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             dom_path = Path(profile) / "rendered-dom.html"
             error_path = Path(profile) / "renderer-error.log"
@@ -1205,37 +1427,18 @@ class WebsiteImageSource:
         expected_host: str,
         label: str,
     ):
-        current_url = url
-        for redirect_count in range(MAX_SAME_SITE_REDIRECTS + 1):
-            if not _same_site_host(urlparse(current_url).netloc, expected_host):
-                raise PhotoArchiveError(f"{label} redirected outside the official site: {current_url}")
-            response = self.session.get(
-                current_url,
-                timeout=timeout,
-                stream=True,
-                allow_redirects=False,
-            )
-            try:
-                status_code = int(getattr(response, "status_code", 200) or 200)
-                if status_code in {301, 302, 303, 307, 308}:
-                    location = str(response.headers.get("Location", "")).strip()
-                    if not location:
-                        raise PhotoArchiveError(f"{label} returned a redirect without a location")
-                    if redirect_count >= MAX_SAME_SITE_REDIRECTS:
-                        raise PhotoArchiveError(f"{label} exceeded the redirect limit")
-                    current_url = urljoin(current_url, location)
-                    continue
-                response.raise_for_status()
-                final_url = str(getattr(response, "url", "") or current_url)
-                if not _same_site_host(urlparse(final_url).netloc, expected_host):
-                    raise PhotoArchiveError(f"{label} redirected outside the official site: {final_url}")
-                content = _bounded_response_content(response, max_bytes, label)
-                return response, content
-            finally:
-                close = getattr(response, "close", None)
-                if callable(close):
-                    close()
-        raise PhotoArchiveError(f"{label} exceeded the redirect limit")
+        response = _request_public_response(
+            self.session,
+            url,
+            timeout=timeout,
+            expected_host=expected_host,
+            label=label,
+        )
+        try:
+            content = _bounded_response_content(response, max_bytes, label)
+            return response, content
+        finally:
+            _close_response(response)
 
     def _fetch_html(self, url: str, start_host: str = "") -> str:
         start_host = start_host or urlparse(url).netloc.lower()
@@ -1785,16 +1988,13 @@ class ArchiveStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_dhash ON photos(dhash)")
 
     def upsert(self, record: PhotoRecord) -> PhotoRecord:
-        existing = self.get_by_source(record.source, record.source_id)
-        if existing:
-            record = _merge_record(existing, record)
         record.research_tags = normalize_research_tags(record.research_tags)
         record.rating = max(0, min(5, _safe_int(record.rating)))
 
         placeholders = ", ".join("?" for _ in PHOTO_COLUMNS)
-        user_columns = {"research_note", "research_tags", "rating"}
+        preserved_columns = RESEARCH_COLUMNS | DOWNLOAD_DERIVED_COLUMNS
         update_columns = ", ".join(
-            f"{column}=photos.{column}" if column in user_columns else f"{column}=excluded.{column}"
+            f"{column}=photos.{column}" if column in preserved_columns else f"{column}=excluded.{column}"
             for column in PHOTO_COLUMNS
             if column not in {"source", "source_id"}
         )
@@ -1808,7 +2008,33 @@ class ArchiveStore:
                 """,
                 values,
             )
-        return self.get_by_source(record.source, record.source_id) or record
+            row = conn.execute(
+                "SELECT * FROM photos WHERE source = ? AND source_id = ?",
+                (record.source, record.source_id),
+            ).fetchone()
+        return _row_to_record(row) or record
+
+    def update_download_state(self, record: PhotoRecord) -> PhotoRecord:
+        record.research_tags = normalize_research_tags(record.research_tags)
+        record.rating = max(0, min(5, _safe_int(record.rating)))
+        placeholders = ", ".join("?" for _ in PHOTO_COLUMNS)
+        values = [_record_value(record, column) for column in PHOTO_COLUMNS]
+        assignments = ", ".join(f"{column} = ?" for column in sorted(DOWNLOAD_DERIVED_COLUMNS))
+        download_values = [_record_value(record, column) for column in sorted(DOWNLOAD_DERIVED_COLUMNS)]
+        with self.connection() as conn:
+            conn.execute(
+                f"INSERT INTO photos ({', '.join(PHOTO_COLUMNS)}) VALUES ({placeholders}) ON CONFLICT(source, source_id) DO NOTHING",
+                values,
+            )
+            conn.execute(
+                f"UPDATE photos SET {assignments} WHERE source = ? AND source_id = ?",
+                [*download_values, record.source, record.source_id],
+            )
+            row = conn.execute(
+                "SELECT * FROM photos WHERE source = ? AND source_id = ?",
+                (record.source, record.source_id),
+            ).fetchone()
+        return _row_to_record(row) or record
 
     def get_by_source(self, source: str, source_id: str) -> Optional[PhotoRecord]:
         with self.connection() as conn:
@@ -1918,8 +2144,11 @@ def download_record(
     destination = _destination_for_record(record, image_dir)
     part_path = destination.with_suffix(destination.suffix + ".part")
 
-    if not destination.exists():
-        try:
+    downloaded_part = False
+    created_destination = False
+    try:
+        working_path = destination
+        if not destination.exists():
             _download_binary(
                 record.image_url,
                 part_path,
@@ -1927,60 +2156,77 @@ def download_record(
                 title=record.title,
                 cancel_event=cancel_event,
             )
-            part_path.replace(destination)
-        except Exception:
-            part_path.unlink(missing_ok=True)
-            raise
+            working_path = part_path
+            downloaded_part = True
 
-    sha256 = sha256_file(destination)
-    dhash = dhash_file(destination)
-    exif_details = extract_exif_details(destination)
-    if Image is not None:
-        try:
-            with Image.open(destination) as downloaded_image:
-                record.width, record.height = downloaded_image.size
-        except (OSError, ValueError):
-            pass
-    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    record.local_path = str(destination)
-    record.sha256 = sha256
-    record.dhash = dhash
-    record.downloaded_at = now
-    for field, value in exif_details.items():
-        if value and not getattr(record, field):
-            setattr(record, field, value)
-    record.duplicate_of = ""
-    record.near_duplicate_of = ""
-    record.duplicate_distance = -1
+        sha256 = sha256_file(working_path)
+        dhash = dhash_file(working_path)
+        exif_details = extract_exif_details(working_path)
+        record.file_size = working_path.stat().st_size
+        if Image is not None:
+            try:
+                with Image.open(working_path) as downloaded_image:
+                    record.width, record.height = downloaded_image.size
+            except (OSError, ValueError):
+                pass
+        record.sha256 = sha256
+        record.dhash = dhash
+        record.downloaded_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        for field, value in exif_details.items():
+            if value and not getattr(record, field):
+                setattr(record, field, value)
+        record.duplicate_of = ""
+        record.near_duplicate_of = ""
+        record.duplicate_distance = -1
 
-    exact = store.get_by_sha256(sha256, exclude_source_key=record.source_key)
-    if exact:
-        record.duplicate_of = exact.source_key
-        record.local_path = exact.local_path
-        try:
-            if destination.exists() and Path(exact.local_path).resolve() != destination.resolve():
-                destination.unlink()
-        except OSError:
-            pass
-        _emit(callback, "duplicate", title=record.title, duplicate_of=exact.title, kind="exact")
-        return store.upsert(record)
+        exact = store.get_by_sha256(sha256, exclude_source_key=record.source_key)
+        if exact and Path(exact.local_path).is_file():
+            record.duplicate_of = exact.source_key
+            record.local_path = exact.local_path
+            if downloaded_part:
+                part_path.unlink(missing_ok=True)
+                downloaded_part = False
+            else:
+                try:
+                    if destination.exists() and Path(exact.local_path).resolve() != destination.resolve():
+                        destination.unlink()
+                except OSError:
+                    pass
+            _emit(callback, "duplicate", title=record.title, duplicate_of=exact.title, kind="exact")
+            return store.update_download_state(record)
 
-    near = find_near_duplicate(record, store.downloaded_records(exclude_source_key=record.source_key), near_duplicate_distance)
-    if near:
-        duplicate, distance = near
-        record.near_duplicate_of = duplicate.source_key
-        record.duplicate_distance = distance
-        _emit(
-            callback,
-            "duplicate",
-            title=record.title,
-            duplicate_of=duplicate.title,
-            kind="near",
-            distance=distance,
+        near = find_near_duplicate(
+            record,
+            store.downloaded_records(exclude_source_key=record.source_key),
+            near_duplicate_distance,
         )
+        if near:
+            duplicate, distance = near
+            record.near_duplicate_of = duplicate.source_key
+            record.duplicate_distance = distance
+            _emit(
+                callback,
+                "duplicate",
+                title=record.title,
+                duplicate_of=duplicate.title,
+                kind="near",
+                distance=distance,
+            )
 
-    _emit(callback, "downloaded", title=record.title, path=record.local_path)
-    return store.upsert(record)
+        if downloaded_part:
+            part_path.replace(destination)
+            downloaded_part = False
+            created_destination = True
+        record.local_path = str(destination)
+        saved = store.update_download_state(record)
+        _emit(callback, "downloaded", title=record.title, path=saved.local_path)
+        return saved
+    except Exception:
+        if downloaded_part:
+            part_path.unlink(missing_ok=True)
+        if created_destination:
+            destination.unlink(missing_ok=True)
+        raise
 
 
 def find_near_duplicate(
@@ -2480,7 +2726,7 @@ def _download_binary(
 ) -> None:
     headers = {"User-Agent": USER_AGENT, "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"}
     try:
-        with requests.get(url, headers=headers, stream=True, timeout=(10, 60)) as response:
+        with open_public_stream(url, headers=headers, timeout=(10, 60), label="Image download") as response:
             response.raise_for_status()
             total = _safe_int(response.headers.get("Content-Length"))
             if total > MAX_IMAGE_DOWNLOAD_BYTES:
@@ -2592,25 +2838,6 @@ def _row_to_record(row: sqlite3.Row | None) -> Optional[PhotoRecord]:
     values["duplicate_distance"] = int(values.get("duplicate_distance") or -1)
     values["rating"] = int(values.get("rating") or 0)
     return PhotoRecord(**values)
-
-
-def _merge_record(existing: PhotoRecord, incoming: PhotoRecord) -> PhotoRecord:
-    for column in [
-        "collection_title",
-        "local_path",
-        "sha256",
-        "dhash",
-        "duplicate_of",
-        "near_duplicate_of",
-        "downloaded_at",
-    ]:
-        if not getattr(incoming, column) and getattr(existing, column):
-            setattr(incoming, column, getattr(existing, column))
-    for column in ["research_note", "research_tags", "rating"]:
-        setattr(incoming, column, getattr(existing, column))
-    if incoming.duplicate_distance == -1 and existing.duplicate_distance != -1:
-        incoming.duplicate_distance = existing.duplicate_distance
-    return incoming
 
 
 def _check_cancel(cancel_event: Optional[Event]) -> None:

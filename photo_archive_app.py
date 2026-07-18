@@ -15,8 +15,6 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-import requests
-
 from photo_archive_core import (
     DEFAULT_MIN_LONG_EDGE,
     DEFAULT_OUTPUT_DIR,
@@ -26,6 +24,7 @@ from photo_archive_core import (
     archive_photographer,
     create_contact_sheet_pages,
     download_record,
+    open_public_stream,
     render_research_markdown,
     safe_filename,
 )
@@ -490,8 +489,10 @@ class PhotoArchiveApp(tk.Tk):
         self.thumbnail_executor = ThreadPoolExecutor(max_workers=THUMBNAIL_WORKERS, thread_name_prefix="photo-thumb")
         self.preview_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="photo-preview")
         self.worker_thread: threading.Thread | None = None
+        self.shutdown_thread: threading.Thread | None = None
         self.cancel_event = threading.Event()
         self.shutdown_event = threading.Event()
+        self.closing = False
         self.busy = False
         self.search_started_at = 0.0
         self.issue_count = 0
@@ -1509,7 +1510,7 @@ class PhotoArchiveApp(tk.Tk):
         self.worker_thread = threading.Thread(
             target=self._archive_worker,
             args=(photographer, output_dir, website_url, limit, download_limit, min_edge, download),
-            daemon=True,
+            daemon=False,
         )
         self.worker_thread.start()
 
@@ -1582,7 +1583,7 @@ class PhotoArchiveApp(tk.Tk):
         self.detail_var.set(f"准备下载 {len(allowed)} 张图片。")
         self._stop_indeterminate_progress()
         self._set_progress(0)
-        self.worker_thread = threading.Thread(target=self._download_records_worker, args=(allowed, output_dir), daemon=True)
+        self.worker_thread = threading.Thread(target=self._download_records_worker, args=(allowed, output_dir), daemon=False)
         self.worker_thread.start()
 
     def _download_records_worker(self, records: list[PhotoRecord], output_dir: Path) -> None:
@@ -1635,11 +1636,17 @@ class PhotoArchiveApp(tk.Tk):
                     self.report_callback_exception(*sys.exc_info())
                 processed += 1
         finally:
-            if self.winfo_exists():
+            try:
+                exists = bool(self.winfo_exists())
+            except tk.TclError:
+                exists = False
+            if exists:
                 self.after(1 if not self.ui_queue.empty() else 50, self._drain_queue)
 
     def _handle_event(self, event: str, payload: dict) -> None:
-        if event == "status":
+        if event == "shutdown_complete":
+            self.destroy()
+        elif event == "status":
             self.phase_var.set("连接来源")
             self.detail_var.set(str(payload.get("message", "")))
             self._log(str(payload.get("message", "")))
@@ -2084,11 +2091,11 @@ class PhotoArchiveApp(tk.Tk):
                     image.convert("RGB").save(rendered, format="JPEG", quality=86)
                     content = rendered.getvalue()
             elif url:
-                with requests.get(
+                with open_public_stream(
                     url,
                     headers={"User-Agent": "PhotoArchiveTool/0.1"},
-                    stream=True,
                     timeout=(5, 12),
+                    label="Thumbnail request",
                 ) as response:
                     response.raise_for_status()
                     declared_size = int(response.headers.get("Content-Length") or 0)
@@ -2210,11 +2217,11 @@ class PhotoArchiveApp(tk.Tk):
         url = next((value for value in urls if value), "")
         if not url:
             raise ValueError("record has no preview URL")
-        with requests.get(
+        with open_public_stream(
             url,
             headers={"User-Agent": "PhotoArchiveTool/0.1"},
-            stream=True,
             timeout=(6, 20),
+            label="Study preview request",
         ) as response:
             response.raise_for_status()
             declared_size = int(response.headers.get("Content-Length") or 0)
@@ -2382,11 +2389,11 @@ class PhotoArchiveApp(tk.Tk):
         try:
             if self.shutdown_event.is_set():
                 return
-            with requests.get(
+            with open_public_stream(
                 url,
                 headers={"User-Agent": "PhotoArchiveTool/0.1"},
-                stream=True,
                 timeout=(5, 12),
+                label="Preview request",
             ) as response:
                 response.raise_for_status()
                 chunks: list[bytes] = []
@@ -2585,12 +2592,29 @@ class PhotoArchiveApp(tk.Tk):
         self.issue_var.set(f"问题 {self.issue_count}")
 
     def _on_close(self) -> None:
+        if self.closing:
+            return
+        self.closing = True
         self.cancel_event.set()
         self.shutdown_event.set()
-        self.thumbnail_executor.shutdown(wait=False, cancel_futures=True)
-        self.preview_executor.shutdown(wait=False, cancel_futures=True)
-        self.study_executor.shutdown(wait=False, cancel_futures=True)
-        self.destroy()
+        self.phase_var.set("\u6b63\u5728\u5b89\u5168\u9000\u51fa")
+        self.detail_var.set("\u6b63\u5728\u505c\u6b62\u7f51\u7edc\u8bf7\u6c42\u5e76\u5199\u5165\u5df2\u5b8c\u6210\u7684\u7ed3\u679c\u3002")
+        self.start_button.configure(state=tk.DISABLED)
+        self.cancel_button.configure(state=tk.DISABLED)
+        self.shutdown_thread = threading.Thread(
+            target=self._wait_for_background_shutdown,
+            name="photo-archive-shutdown",
+            daemon=False,
+        )
+        self.shutdown_thread.start()
+
+    def _wait_for_background_shutdown(self) -> None:
+        worker = self.worker_thread
+        if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+            worker.join()
+        for executor in (self.thumbnail_executor, self.preview_executor, self.study_executor):
+            executor.shutdown(wait=True, cancel_futures=True)
+        self.ui_queue.put(("shutdown_complete", {}))
 
     def _log(self, message: str) -> None:
         if not message:
@@ -2621,9 +2645,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args == ["--ui-smoke"]:
         app = PhotoArchiveApp(load_archive=False)
+        probe = threading.Thread(
+            target=lambda: app.shutdown_event.wait(5),
+            name="photo-archive-ui-smoke-worker",
+            daemon=False,
+        )
+        app.worker_thread = probe
+        probe.start()
         app.after(1200, app._on_close)
         app.mainloop()
-        return 0
+        return 0 if not probe.is_alive() else 3
     app = PhotoArchiveApp()
     app.mainloop()
     return 0

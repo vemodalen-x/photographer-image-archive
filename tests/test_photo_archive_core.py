@@ -36,6 +36,7 @@ from photo_archive_core import (
     create_contact_sheet_pages,
     dhash_file,
     discover_official_website,
+    download_record,
     extract_exif_details,
     find_near_duplicate,
     hamming_distance_hex,
@@ -45,6 +46,26 @@ from photo_archive_core import (
     safe_filename,
     sha256_file,
 )
+
+
+@pytest.fixture(autouse=True)
+def resolve_reserved_test_hosts(monkeypatch: pytest.MonkeyPatch):
+    real_getaddrinfo = photo_archive_core.socket.getaddrinfo
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        if str(host).casefold().endswith(".test"):
+            return [
+                (
+                    photo_archive_core.socket.AF_INET,
+                    photo_archive_core.socket.SOCK_STREAM,
+                    6,
+                    "",
+                    ("93.184.216.34", port or 0),
+                )
+            ]
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(photo_archive_core.socket, "getaddrinfo", getaddrinfo)
 
 
 def test_archive_store_explicitly_closes_every_connection(tmp_path: Path, monkeypatch) -> None:
@@ -75,6 +96,8 @@ def test_archive_store_explicitly_closes_every_connection(tmp_path: Path, monkey
 def test_download_binary_rejects_declared_oversized_image(tmp_path: Path, monkeypatch) -> None:
     class OversizedResponse:
         headers = {"Content-Length": str(MAX_IMAGE_DOWNLOAD_BYTES + 1)}
+        status_code = 200
+        url = "https://example.test/oversized.jpg"
 
         def __enter__(self):
             return self
@@ -85,7 +108,10 @@ def test_download_binary_rejects_declared_oversized_image(tmp_path: Path, monkey
         def raise_for_status(self) -> None:
             return None
 
-    monkeypatch.setattr(photo_archive_core.requests, "get", lambda *_args, **_kwargs: OversizedResponse())
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(photo_archive_core.requests.Session, "get", lambda *_args, **_kwargs: OversizedResponse())
     destination = tmp_path / "oversized.part"
 
     with pytest.raises(photo_archive_core.PhotoArchiveError, match="512 MiB"):
@@ -196,10 +222,75 @@ def test_website_fetch_does_not_visit_cross_site_redirect_target() -> None:
             return Response()
 
     source = WebsiteImageSource(session=Session())
-    with pytest.raises(photo_archive_core.PhotoArchiveError, match="redirected outside"):
+    with pytest.raises(photo_archive_core.PhotoArchiveError, match="non-public network destination"):
         source._fetch_html("https://example.test/gallery")
 
     assert requested == ["https://example.test/gallery"]
+
+
+def test_website_fetch_rejects_private_host_before_request() -> None:
+    class Session:
+        headers: dict[str, str] = {}
+
+        def get(self, *_args, **_kwargs):
+            raise AssertionError("private destination must not be requested")
+
+    source = WebsiteImageSource(session=Session())
+    with pytest.raises(photo_archive_core.PhotoArchiveError, match="non-public network destination"):
+        source._fetch_html("http://127.0.0.1/private")
+
+
+def test_download_rejects_private_redirect_before_target_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    requested: list[str] = []
+
+    class RedirectResponse:
+        headers = {"Location": "http://127.0.0.1/private.jpg"}
+        status_code = 302
+        url = "https://example.test/image.jpg"
+
+        def close(self) -> None:
+            return None
+
+    def get(_session, url: str, **_kwargs):
+        requested.append(url)
+        return RedirectResponse()
+
+    monkeypatch.setattr(photo_archive_core.requests.Session, "get", get)
+    with pytest.raises(photo_archive_core.PhotoArchiveError, match="non-public network destination"):
+        _download_binary("https://example.test/image.jpg", tmp_path / "image.part")
+
+    assert requested == ["https://example.test/image.jpg"]
+
+
+def test_public_request_rejects_private_connected_peer() -> None:
+    class Socket:
+        def getpeername(self):
+            return ("127.0.0.1", 443)
+
+    class Raw:
+        _connection = SimpleNamespace(sock=Socket())
+
+        def close(self) -> None:
+            return None
+
+        def release_conn(self) -> None:
+            return None
+
+    response = photo_archive_core.requests.Response()
+    response.status_code = 200
+    response.url = "https://example.test/image.jpg"
+    response.raw = Raw()
+
+    class Session:
+        def get(self, *_args, **_kwargs):
+            return response
+
+    with pytest.raises(photo_archive_core.PhotoArchiveError, match="non-public network destination"):
+        photo_archive_core._request_public_response(
+            Session(),
+            "https://example.test/image.jpg",
+            timeout=(5, 10),
+        )
 
 
 def test_website_parser_bounds_links_and_candidates() -> None:
@@ -750,13 +841,39 @@ def test_website_source_does_not_render_when_static_html_has_work_image() -> Non
 def test_browser_renderer_command_uses_isolated_profile_and_keeps_sandbox(tmp_path: Path) -> None:
     renderer = BrowserDOMRenderer(executable=tmp_path / "chrome.exe")
     profile = tmp_path / "isolated-profile"
-    command = renderer.build_command(profile, "https://example.test/")
+    command = renderer.build_command(profile, "https://example.test/", "http://127.0.0.1:9999")
 
     assert f"--user-data-dir={profile}" in command
     assert "--virtual-time-budget=10000" in command
     assert "--no-sandbox" not in command
+    assert "--proxy-server=http://127.0.0.1:9999" in command
+    assert any("MAP * ~NOTFOUND" in argument for argument in command)
+    assert any("MAP example.test 93.184.216.34" in argument for argument in command)
+    assert any("<-loopback>" in argument for argument in command)
     assert all("cookie" not in argument.casefold() for argument in command)
     assert all("profile-directory" not in argument.casefold() for argument in command)
+
+
+def test_browser_renderer_blocks_private_url_before_browser_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    executable = tmp_path / "chrome.exe"
+    executable.touch()
+    launched = False
+
+    def popen(*_args, **_kwargs):
+        nonlocal launched
+        launched = True
+        raise AssertionError("private page must not launch Chromium")
+
+    monkeypatch.setattr(photo_archive_core.subprocess, "Popen", popen)
+    events: list[tuple[str, dict]] = []
+    result = BrowserDOMRenderer(executable=executable).render(
+        "http://127.0.0.1/private",
+        callback=lambda event, payload: events.append((event, payload)),
+    )
+
+    assert result == ""
+    assert not launched
+    assert any(event == "source_blocked" and "non-public" in payload["message"] for event, payload in events)
 
 
 def test_browser_renderer_skips_oversized_dom_without_failing_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1239,6 +1356,77 @@ def test_archive_store_preserves_download_fields_on_metadata_refresh(tmp_path: P
     assert result.title == "Updated title"
     assert result.local_path == downloaded.local_path
     assert result.sha256 == "abc"
+
+
+def test_archive_store_rejects_stale_nonempty_download_state(tmp_path: Path) -> None:
+    store = ArchiveStore(tmp_path / "photo_archive.db")
+    current = PhotoRecord(
+        source="website",
+        source_id="download-race-1",
+        search_name="Example",
+        title="Current title",
+        page_url="https://example.test/work/1",
+        image_url="https://example.test/work/1.jpg",
+        width=2500,
+        height=1667,
+        local_path=str(tmp_path / "current.jpg"),
+        sha256="current-sha",
+        dhash="current-dhash",
+        downloaded_at="2026-07-18T12:00:00+00:00",
+    )
+    store.update_download_state(current)
+
+    stale = PhotoRecord(
+        source="website",
+        source_id="download-race-1",
+        search_name="Example",
+        title="Refreshed metadata",
+        page_url="https://example.test/work/1",
+        image_url="https://example.test/work/1.jpg",
+        width=640,
+        height=427,
+        local_path=str(tmp_path / "stale.jpg"),
+        sha256="stale-sha",
+        dhash="stale-dhash",
+        downloaded_at="2026-07-18T11:00:00+00:00",
+    )
+    result = store.upsert(stale)
+
+    assert result.title == "Refreshed metadata"
+    assert result.local_path == current.local_path
+    assert result.sha256 == "current-sha"
+    assert result.dhash == "current-dhash"
+    assert result.downloaded_at == current.downloaded_at
+    assert (result.width, result.height) == (2500, 1667)
+
+
+def test_download_rolls_back_new_file_when_database_write_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    if photo_archive_core.Image is None:
+        pytest.skip("Pillow is unavailable")
+    store = ArchiveStore(tmp_path / "photo_archive.db")
+    record = PhotoRecord(
+        source="website",
+        source_id="rollback-1",
+        search_name="Example",
+        title="Rollback image",
+        page_url="https://example.test/work/rollback",
+        image_url="https://example.test/work/rollback.jpg",
+    )
+
+    def fake_download(_url: str, destination: Path, **_kwargs) -> None:
+        photo_archive_core.Image.new("RGB", (32, 24), "white").save(destination, format="JPEG")
+
+    def fail_update(_record: PhotoRecord) -> PhotoRecord:
+        raise sqlite3.OperationalError("database unavailable")
+
+    monkeypatch.setattr(photo_archive_core, "_download_binary", fake_download)
+    monkeypatch.setattr(store, "update_download_state", fail_update)
+
+    with pytest.raises(sqlite3.OperationalError, match="database unavailable"):
+        download_record(record, tmp_path, store)
+
+    image_dir = tmp_path / "Example" / "images"
+    assert list(image_dir.glob("*")) == []
 
 
 def test_archive_store_preserves_research_content_on_source_refresh(tmp_path: Path) -> None:

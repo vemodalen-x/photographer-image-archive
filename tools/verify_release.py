@@ -23,11 +23,11 @@ FORBIDDEN_SUFFIXES = {
 }
 SCREENSHOT_NAMES = re.compile(r"(?i)(screen[-_ ]?shot|capture|review[-_ ]?image|desktop[-_ ]?view)")
 PATH_PATTERNS = (
-    re.compile(rb"(?i)[A-Z]:[\\/]Users[\\/][A-Za-z0-9._-]+[\\/]"),
+    re.compile(rb"(?i)[A-Z]:(?:\\+|/)Users(?:\\+|/)[A-Za-z0-9._-]+(?:\\+|/)"),
     re.compile(rb"(?i)/(?:Users|home)/[A-Za-z0-9._-]+/"),
 )
 TEXT_PATH_PATTERNS = (
-    re.compile(r"(?i)[A-Z]:[\\/]Users[\\/][A-Za-z0-9._-]+[\\/]"),
+    re.compile(r"(?i)[A-Z]:(?:\\+|/)Users(?:\\+|/)[A-Za-z0-9._-]+(?:\\+|/)"),
     re.compile(r"(?i)/(?:Users|home)/[A-Za-z0-9._-]+/"),
 )
 SECRET_PATTERNS = (
@@ -42,6 +42,26 @@ TEXT_SECRET_PATTERNS = (
     re.compile(r"ghp_[A-Za-z0-9]{20,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
 )
+WIDE_TEXT_ENCODINGS = ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+THIRD_PARTY_LICENSE_FILES = {
+    "BZIP2.txt",
+    "CERTIFI.txt",
+    "CHARSET_NORMALIZER.txt",
+    "IDNA.txt",
+    "LIBFFI.txt",
+    "LUCIDE.txt",
+    "OPENSSL.txt",
+    "PILLOW.txt",
+    "PYINSTALLER.txt",
+    "PYTHON.txt",
+    "REQUESTS-NOTICE.txt",
+    "REQUESTS.txt",
+    "SQLITE.txt",
+    "TCL-TK.txt",
+    "URLLIB3.txt",
+    "XZ.txt",
+    "ZLIB.txt",
+}
 
 
 class ReleaseVerificationError(RuntimeError):
@@ -58,15 +78,17 @@ def sha256_file(path: Path) -> str:
 
 def _expected_entries(version: str) -> set[str]:
     root = f"PhotographerImageArchive-{version}-windows-x64"
-    return {
+    entries = {
         f"{root}/PhotographerImageArchive.exe",
         f"{root}/README.md",
         f"{root}/LICENSE",
         f"{root}/CHANGELOG.md",
         f"{root}/PRIVACY.md",
+        f"{root}/SECURITY.md",
         f"{root}/THIRD_PARTY_NOTICES.md",
-        f"{root}/THIRD_PARTY_LICENSES/LUCIDE.txt",
     }
+    entries.update(f"{root}/THIRD_PARTY_LICENSES/{name}" for name in THIRD_PARTY_LICENSE_FILES)
+    return entries
 
 
 def _check_entry_name(name: str) -> None:
@@ -78,13 +100,13 @@ def _check_entry_name(name: str) -> None:
 
 
 def _check_content(name: str, data: bytes) -> None:
-    utf16_text = data.decode("utf-16-le", errors="ignore")
+    wide_text = tuple(data.decode(encoding, errors="ignore") for encoding in WIDE_TEXT_ENCODINGS)
     if any(pattern.search(data) for pattern in PATH_PATTERNS) or any(
-        pattern.search(utf16_text) for pattern in TEXT_PATH_PATTERNS
+        pattern.search(text) for text in wide_text for pattern in TEXT_PATH_PATTERNS
     ):
         raise ReleaseVerificationError(f"absolute user path embedded in {name}")
     if any(pattern.search(data) for pattern in SECRET_PATTERNS) or any(
-        pattern.search(utf16_text) for pattern in TEXT_SECRET_PATTERNS
+        pattern.search(text) for text in wide_text for pattern in TEXT_SECRET_PATTERNS
     ):
         raise ReleaseVerificationError(f"credential-like content embedded in {name}")
 

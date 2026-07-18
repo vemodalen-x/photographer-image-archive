@@ -1,9 +1,12 @@
 # Third-Party Notices
 
-- Lucide icons are redistributed under the ISC License. The bundled release notice is in `THIRD_PARTY_LICENSES/LUCIDE.txt`.
-- Requests is distributed under the Apache License 2.0.
-- Pillow is distributed under the HPND License.
-- PyInstaller is used to create the Windows executable and is distributed under GPL-2.0-or-later with an exception that permits bundling applications.
-- Python and Tcl/Tk components included by the build retain their respective upstream licenses.
+The release includes the applicable license and notice texts under `THIRD_PARTY_LICENSES/`:
+
+- Lucide icons: `LUCIDE.txt`.
+- Requests and its runtime dependencies urllib3, Certifi, Charset Normalizer, and idna: `REQUESTS.txt`, `REQUESTS-NOTICE.txt`, `URLLIB3.txt`, `CERTIFI.txt`, `CHARSET_NORMALIZER.txt`, and `IDNA.txt`.
+- Pillow and its bundled imaging components: `PILLOW.txt`.
+- PyInstaller bootloader and runtime: `PYINSTALLER.txt`.
+- CPython and Tcl/Tk: `PYTHON.txt` and `TCL-TK.txt`.
+- Runtime libraries distributed with the Windows build: `OPENSSL.txt`, `ZLIB.txt`, `BZIP2.txt`, `XZ.txt`, `LIBFFI.txt`, and `SQLITE.txt`.
 
 Photographs discovered or downloaded by the application are not part of this software license. Their rights and permitted uses remain governed by the source website, credited creator, and recorded license metadata.

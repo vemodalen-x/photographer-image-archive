@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent
 VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 PRODUCT_BASENAME = "PhotographerImageArchive"
 PACKAGE_ROOT_NAME = f"{PRODUCT_BASENAME}-{VERSION}-windows-x64"
-PUBLIC_DOCUMENTS = ("README.md", "LICENSE", "CHANGELOG.md", "PRIVACY.md", "THIRD_PARTY_NOTICES.md")
+PUBLIC_DOCUMENTS = ("README.md", "LICENSE", "CHANGELOG.md", "PRIVACY.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md")
 
 
 def _remove_generated(path: Path) -> None:
@@ -85,9 +85,7 @@ def build() -> tuple[Path, Path]:
     shutil.copy2(executable, stage / executable.name)
     for name in PUBLIC_DOCUMENTS:
         shutil.copy2(ROOT / name, stage / name)
-    third_party_licenses = stage / "THIRD_PARTY_LICENSES"
-    third_party_licenses.mkdir()
-    shutil.copy2(ROOT / "assets" / "photo_archive_icons" / "LICENSE.txt", third_party_licenses / "LUCIDE.txt")
+    shutil.copytree(ROOT / "THIRD_PARTY_LICENSES", stage / "THIRD_PARTY_LICENSES")
 
     zip_path = dist_root / f"{PACKAGE_ROOT_NAME}.zip"
     _write_deterministic_zip(stage, zip_path)

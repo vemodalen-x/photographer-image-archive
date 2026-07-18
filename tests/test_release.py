@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import zipfile
 from pathlib import Path
 
 import pytest
 
 from tools.audit_public_source import audit_source
-from tools.verify_release import ReleaseVerificationError, verify_release
+from tools.verify_release import THIRD_PARTY_LICENSE_FILES, ReleaseVerificationError, verify_release
 
 VERSION = "1.0.0"
 PACKAGE_ROOT = f"PhotographerImageArchive-{VERSION}-windows-x64"
@@ -17,9 +18,12 @@ EXPECTED_FILES = {
     "LICENSE": b"license",
     "CHANGELOG.md": b"changes",
     "PRIVACY.md": b"privacy",
+    "SECURITY.md": b"security",
     "THIRD_PARTY_NOTICES.md": b"notices",
-    "THIRD_PARTY_LICENSES/LUCIDE.txt": b"lucide license",
 }
+EXPECTED_FILES.update(
+    {f"THIRD_PARTY_LICENSES/{name}": f"license for {name}".encode() for name in THIRD_PARTY_LICENSE_FILES}
+)
 
 
 def _package(tmp_path: Path, files: dict[str, bytes] | None = None) -> tuple[Path, Path]:
@@ -56,18 +60,20 @@ def test_release_verifier_rejects_embedded_user_path(tmp_path: Path) -> None:
         verify_release(zip_path, checksum, VERSION)
 
 
-def test_release_verifier_rejects_utf16_user_path(tmp_path: Path) -> None:
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"])
+def test_release_verifier_rejects_wide_user_path(tmp_path: Path, encoding: str) -> None:
     files = dict(EXPECTED_FILES)
-    local_path = ("C:" + "\\Users\\" + "PrivateDeveloper\\Pictures\\archive.db").encode("utf-16-le")
+    local_path = ("C:" + "\\Users\\" + "PrivateDeveloper\\Pictures\\archive.db").encode(encoding)
     files["PhotographerImageArchive.exe"] += local_path
     zip_path, checksum = _package(tmp_path, files)
     with pytest.raises(ReleaseVerificationError, match="absolute user path"):
         verify_release(zip_path, checksum, VERSION)
 
 
-def test_release_verifier_rejects_utf16_credential(tmp_path: Path) -> None:
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"])
+def test_release_verifier_rejects_wide_credential(tmp_path: Path, encoding: str) -> None:
     files = dict(EXPECTED_FILES)
-    token = ("ghp_" + "A" * 32).encode("utf-16-le")
+    token = ("ghp_" + "A" * 32).encode(encoding)
     files["PhotographerImageArchive.exe"] += token
     zip_path, checksum = _package(tmp_path, files)
     with pytest.raises(ReleaseVerificationError, match="credential-like"):
@@ -104,8 +110,36 @@ def test_source_audit_rejects_another_developer_home_path(tmp_path: Path) -> Non
     assert audit_source(tmp_path)
 
 
-def test_source_audit_rejects_utf16_credential(tmp_path: Path) -> None:
-    token = ("ghp_" + "B" * 32).encode("utf-16-le")
+@pytest.mark.parametrize("encoding", ["utf-16-be", "utf-32-le", "utf-32-be"])
+def test_source_audit_rejects_wide_other_developer_path(tmp_path: Path, encoding: str) -> None:
+    private_path = "C:" + "\\Users\\" + "AnotherDeveloper\\Pictures\\archive.db"
+    (tmp_path / "resource.bin").write_bytes(private_path.encode(encoding))
+
+    assert audit_source(tmp_path)
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"])
+def test_source_audit_rejects_wide_credential(tmp_path: Path, encoding: str) -> None:
+    token = ("ghp_" + "B" * 32).encode(encoding)
     (tmp_path / "resource.bin").write_bytes(token)
 
     assert audit_source(tmp_path)
+
+
+def test_all_declared_third_party_licenses_are_tracked() -> None:
+    root = Path(__file__).resolve().parents[1]
+    license_dir = root / "THIRD_PARTY_LICENSES"
+
+    assert {path.name for path in license_dir.iterdir() if path.is_file()} == THIRD_PARTY_LICENSE_FILES
+    assert all((license_dir / name).stat().st_size > 20 for name in THIRD_PARTY_LICENSE_FILES)
+
+
+def test_release_workflow_pins_actions_and_limits_write_permission() -> None:
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github" / "workflows" / "windows-release.yml").read_text(encoding="utf-8")
+    action_refs = re.findall(r"uses:\s+[^@\s]+@([^\s#]+)", workflow)
+
+    assert action_refs
+    assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in action_refs)
+    assert workflow.count("contents: write") == 1
+    assert workflow.index("publish-release:") < workflow.index("contents: write")

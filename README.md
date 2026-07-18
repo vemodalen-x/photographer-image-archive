@@ -99,7 +99,9 @@ Existing databases are migrated in place when the app opens; the collection and 
 
 Unknown HTML dimensions are no longer treated as low resolution: those records remain marked `待确认` and their true pixel dimensions are written back after download. Current limitation: some galleries reveal images only after gestures or private API calls, and authenticated social networks may expose no usable public page. The bounded browser fallback does not interact with login prompts, consent walls, endless sessions, or access controls, so those sources may still require opening the source page manually.
 
-UI iconography is derived from Lucide and distributed with its ISC/MIT license in `assets/photo_archive_icons/LICENSE.txt`.
+For network safety, the dynamic browser fallback only permits the validated official-site host. Galleries that require cross-host scripts may therefore need to be opened manually.
+
+UI iconography is derived from Lucide. Source and release distributions include its ISC/MIT terms in `assets/photo_archive_icons/LICENSE.txt` and `THIRD_PARTY_LICENSES/LUCIDE.txt` respectively.
 
 The default minimum long edge is 1080px. Use `--min-edge 0` if you want to save metadata or images regardless of resolution.
 
