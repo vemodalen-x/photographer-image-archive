@@ -30,7 +30,7 @@ def _remove_generated(path: Path) -> None:
 def _release_entry_bytes(path: Path, source_dir: Path) -> bytes:
     relative = path.relative_to(source_dir)
     data = path.read_bytes()
-    if relative.name in PUBLIC_DOCUMENTS or relative.parts[:1] == ("THIRD_PARTY_LICENSES",):
+    if relative.name in PUBLIC_DOCUMENTS:
         text = data.decode("utf-8")
         return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
     return data

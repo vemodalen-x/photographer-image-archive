@@ -1501,17 +1501,27 @@ def test_commons_record_filters_private_camera_metadata() -> None:
                     "CreditLine": {"value": "Example credit"},
                     "GPSLatitude": {"value": "1.234"},
                     "GPSLongitude": {"value": "5.678"},
+                    "EXIF:CameraOwnerName": {"value": "private owner"},
+                    "Exif.Photo.UserComment": {"value": "private ext comment"},
                 },
                 "metadata": [
                     {"name": "UserComment", "value": "private note"},
+                    {"name": "EXIF:UserComment", "value": "private namespaced note"},
+                    {"name": "Exif.Photo.MakerNote", "value": "private maker note"},
+                    {"name": "MakerNoteUnknownText", "value": "private vendor maker note"},
                     {"name": "Composite:GPSPosition", "value": "1.234, 5.678"},
                     {"name": "BodySerialNumber", "value": "ABC123"},
                     {"name": "CameraSerialNumber", "value": "CAM456"},
                     {"name": "DeviceSerialNumber", "value": "DEV789"},
                     {"name": "InternalSerialNumber", "value": "INT012"},
+                    {"name": "EXIF:LensSerialNumberDecoded", "value": "LENS345"},
                     {"name": "Model", "value": "Research Camera"},
+                    {"name": "ImageDescription", "value": "Research description"},
                 ],
-                "commonmetadata": [{"name": "XPComment", "value": "hidden note"}],
+                "commonmetadata": [
+                    {"name": "XPComment", "value": "hidden note"},
+                    {"name": "EXIF:XPComment", "value": "hidden namespaced note"},
+                ],
             }
         ],
     }
@@ -1524,11 +1534,20 @@ def test_commons_record_filters_private_camera_metadata() -> None:
     raw = record.raw_metadata_json.casefold()
     assert "gps" not in raw
     assert "private note" not in raw
+    assert "private namespaced note" not in raw
+    assert "private ext comment" not in raw
+    assert "private maker note" not in raw
+    assert "private vendor maker note" not in raw
+    assert "private owner" not in raw
     assert "hidden note" not in raw
+    assert "hidden namespaced note" not in raw
     assert "abc123" not in raw
     assert "cam456" not in raw
     assert "dev789" not in raw
     assert "int012" not in raw
+    assert "lens345" not in raw
+    assert "research camera" in raw
+    assert "research description" in raw
 
 
 def test_archive_uses_auto_discovered_official_site_when_url_is_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

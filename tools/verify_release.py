@@ -110,7 +110,8 @@ def _check_entry_name(name: str) -> None:
 
 
 def _check_content(name: str, data: bytes) -> None:
-    if not name.endswith("/PhotographerImageArchive.exe") and b"\r" in data:
+    preserve_raw_bytes = name.endswith("/PhotographerImageArchive.exe") or "/THIRD_PARTY_LICENSES/" in name
+    if not preserve_raw_bytes and b"\r" in data:
         raise ReleaseVerificationError(f"non-canonical text line endings in {name}")
     if any(pattern.search(data) for pattern in PATH_PATTERNS) or any(
         pattern.search(text) for text in _wide_text_views(data) for pattern in TEXT_PATH_PATTERNS

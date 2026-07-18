@@ -83,6 +83,14 @@ def test_release_verifier_rejects_noncanonical_text_line_endings(tmp_path: Path)
         verify_release(zip_path, checksum, VERSION)
 
 
+def test_release_verifier_allows_original_third_party_license_line_endings(tmp_path: Path) -> None:
+    files = dict(EXPECTED_FILES)
+    files["THIRD_PARTY_LICENSES/CHARSET_NORMALIZER.txt"] = b"first line\r\nsecond line\r\n"
+    zip_path, checksum = _package(tmp_path, files)
+
+    verify_release(zip_path, checksum, VERSION)
+
+
 @pytest.mark.parametrize(("encoding", "alignment"), WIDE_ENCODINGS)
 def test_release_verifier_rejects_wide_user_path(tmp_path: Path, encoding: str, alignment: int) -> None:
     local_path = ("C:" + "\\Users\\" + "PrivateDeveloper\\Pictures\\archive.db").encode(encoding)
@@ -159,7 +167,7 @@ def test_all_declared_third_party_licenses_are_tracked() -> None:
     assert all((license_dir / name).stat().st_size > 20 for name in THIRD_PARTY_LICENSE_FILES)
 
 
-def test_deterministic_zip_normalizes_public_text_line_endings(tmp_path: Path) -> None:
+def test_deterministic_zip_normalizes_public_text_and_preserves_license_bytes(tmp_path: Path) -> None:
     lf_stage = tmp_path / "lf"
     crlf_stage = tmp_path / "crlf"
     for stage, newline in ((lf_stage, b"\n"), (crlf_stage, b"\r\n")):
@@ -175,21 +183,35 @@ def test_deterministic_zip_normalizes_public_text_line_endings(tmp_path: Path) -
     _write_deterministic_zip(lf_stage, lf_zip)
     _write_deterministic_zip(crlf_stage, crlf_zip)
 
-    assert lf_zip.read_bytes() == crlf_zip.read_bytes()
+    with zipfile.ZipFile(lf_zip) as archive:
+        assert archive.read(f"{PACKAGE_ROOT}/README.md") == b"first\nsecond\n"
+        assert archive.read(f"{PACKAGE_ROOT}/THIRD_PARTY_LICENSES/EXAMPLE.txt") == b"license\nnotice\n"
+    with zipfile.ZipFile(crlf_zip) as archive:
+        assert archive.read(f"{PACKAGE_ROOT}/README.md") == b"first\nsecond\n"
+        assert archive.read(f"{PACKAGE_ROOT}/THIRD_PARTY_LICENSES/EXAMPLE.txt") == b"license\r\nnotice\r\n"
 
 
-def test_pillow_license_matches_locked_distribution_bytes() -> None:
+@pytest.mark.parametrize(
+    ("distribution_name", "target_name", "source_name"),
+    [
+        ("charset-normalizer", "CHARSET_NORMALIZER.txt", "LICENSE"),
+        ("Pillow", "PILLOW.txt", "LICENSE"),
+    ],
+)
+def test_license_matches_locked_distribution_bytes(
+    distribution_name: str,
+    target_name: str,
+    source_name: str,
+) -> None:
     root = Path(__file__).resolve().parents[1]
-    pillow = distribution("Pillow")
+    package = distribution(distribution_name)
     license_entry = next(
         entry
-        for entry in (pillow.files or ())
-        if str(entry).replace("\\", "/").endswith(".dist-info/licenses/LICENSE")
+        for entry in (package.files or ())
+        if str(entry).replace("\\", "/").endswith(f".dist-info/licenses/{source_name}")
     )
 
-    assert (root / "THIRD_PARTY_LICENSES" / "PILLOW.txt").read_bytes() == Path(
-        pillow.locate_file(license_entry)
-    ).read_bytes()
+    assert (root / "THIRD_PARTY_LICENSES" / target_name).read_bytes() == Path(package.locate_file(license_entry)).read_bytes()
 
 
 @pytest.mark.parametrize(("name", "expected_hash"), sorted(RUNTIME_LICENSE_HASHES.items()))
@@ -243,6 +265,9 @@ def test_release_workflow_pins_actions_and_limits_write_permission() -> None:
     assert "0905638dcd7bb214261fe0ac6136d4dbbb9c4266fa3cf4c5bf4ffce834ae5357" in workflow
     assert "tools\\create_locked_conda_env.ps1" in workflow
     assert ".venv-release\\python.exe" in workflow
+    assert "fetch-depth: 0" in workflow
+    assert "git fetch --no-tags origin main" in workflow
+    assert 'git merge-base --is-ancestor "$GITHUB_SHA" origin/main' in workflow
 
 
 def test_windows_runtime_lock_uses_exact_artifacts() -> None:

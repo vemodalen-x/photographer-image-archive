@@ -3162,13 +3162,8 @@ def _metadata_list_to_map(raw: list) -> dict[str, str]:
 
 def _private_metadata_key(value: object) -> bool:
     normalized = re.sub(r"[^a-z0-9]", "", str(value).casefold())
-    return "gps" in normalized or normalized.endswith("serialnumber") or normalized in {
-        "cameraownername",
-        "makernote",
-        "ownername",
-        "usercomment",
-        "xpcomment",
-    }
+    private_fragments = ("gps", "serialnumber", "ownername", "makernote", "usercomment", "xpcomment")
+    return any(fragment in normalized for fragment in private_fragments)
 
 
 def _file_title_to_name(value: str) -> str:
