@@ -3162,13 +3162,10 @@ def _metadata_list_to_map(raw: list) -> dict[str, str]:
 
 def _private_metadata_key(value: object) -> bool:
     normalized = re.sub(r"[^a-z0-9]", "", str(value).casefold())
-    return "gps" in normalized or normalized in {
-        "bodyserialnumber",
+    return "gps" in normalized or normalized.endswith("serialnumber") or normalized in {
         "cameraownername",
-        "lensserialnumber",
         "makernote",
         "ownername",
-        "serialnumber",
         "usercomment",
         "xpcomment",
     }

@@ -1506,6 +1506,9 @@ def test_commons_record_filters_private_camera_metadata() -> None:
                     {"name": "UserComment", "value": "private note"},
                     {"name": "Composite:GPSPosition", "value": "1.234, 5.678"},
                     {"name": "BodySerialNumber", "value": "ABC123"},
+                    {"name": "CameraSerialNumber", "value": "CAM456"},
+                    {"name": "DeviceSerialNumber", "value": "DEV789"},
+                    {"name": "InternalSerialNumber", "value": "INT012"},
                     {"name": "Model", "value": "Research Camera"},
                 ],
                 "commonmetadata": [{"name": "XPComment", "value": "hidden note"}],
@@ -1523,6 +1526,9 @@ def test_commons_record_filters_private_camera_metadata() -> None:
     assert "private note" not in raw
     assert "hidden note" not in raw
     assert "abc123" not in raw
+    assert "cam456" not in raw
+    assert "dev789" not in raw
+    assert "int012" not in raw
 
 
 def test_archive_uses_auto_discovered_official_site_when_url_is_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

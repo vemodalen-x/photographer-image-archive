@@ -29,6 +29,7 @@ EXPECTED_FILES.update(
     {f"THIRD_PARTY_LICENSES/{name}": f"license for {name}".encode() for name in THIRD_PARTY_LICENSE_FILES}
 )
 RUNTIME_LICENSE_HASHES = {
+    "BZIP2.txt": "c6dbbf828498be844a89eaa3b84adbab3199e342eb5cb2ed2f0d4ba7ec0f38a3",
     "LIBFFI.txt": "67894089811f93fca47a76f85e017da6f8582d4ba0905963c6e0f1ad6df7a195",
     "PYINSTALLER.txt": "dcf75fdb959db1e3b41c0f8505069d2ece781b5ec6b3d0a4d30975cfc6580245",
     "TCL-TK.txt": "2cde822b93ca16ae535c954b7dfe658b4ad10df2a193628d1b358f1765e8b198",
