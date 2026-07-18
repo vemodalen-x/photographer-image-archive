@@ -294,6 +294,108 @@ def test_public_request_rejects_private_connected_peer() -> None:
         )
 
 
+def test_pinned_adapter_connects_to_validated_ip_with_original_tls_identity() -> None:
+    adapter = photo_archive_core._PinnedAddressAdapter(
+        "93.184.216.34",
+        "example.test",
+        "example.test",
+    )
+    request = photo_archive_core.requests.Request(
+        "GET",
+        "https://example.test/gallery",
+    ).prepare()
+
+    adapter.add_headers(request)
+    pool = adapter.get_connection_with_tls_context(request, True, proxies={}, cert=None)
+
+    assert request.headers["Host"] == "example.test"
+    assert pool.host == "93.184.216.34"
+    assert pool.assert_hostname == "example.test"
+    assert pool.conn_kw["server_hostname"] == "example.test"
+    adapter.close()
+
+
+def test_public_request_does_not_reresolve_hostname_during_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolutions: list[str] = []
+    observed: dict[str, object] = {}
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        resolutions.append(str(host))
+        address = "93.184.216.34" if len(resolutions) == 1 else "127.0.0.1"
+        return [(photo_archive_core.socket.AF_INET, photo_archive_core.socket.SOCK_STREAM, 6, "", (address, 0))]
+
+    class Response:
+        headers: dict[str, str] = {}
+        status_code = 200
+        url = "https://rebind.test/gallery"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    def get(session, url: str, **_kwargs):
+        adapter = session.get_adapter(url)
+        observed["address"] = getattr(adapter, "address", "")
+        return Response()
+
+    monkeypatch.setattr(photo_archive_core.socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(photo_archive_core.requests.Session, "get", get)
+    session = photo_archive_core.requests.Session()
+    response = photo_archive_core._request_public_response(
+        session,
+        "https://rebind.test/gallery",
+        timeout=(5, 10),
+    )
+    photo_archive_core._close_response(response)
+    session.close()
+
+    assert resolutions == ["rebind.test"]
+    assert observed["address"] == "93.184.216.34"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://rebind.test:443/gallery",
+        "https://rebind.test./gallery",
+    ],
+)
+def test_pinned_adapter_covers_noncanonical_public_url_origins(
+    url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class Response:
+        headers: dict[str, str] = {}
+        status_code = 200
+
+        def __init__(self, final_url: str) -> None:
+            self.url = final_url
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    def get(session, requested_url: str, **_kwargs):
+        observed["adapter"] = session.get_adapter(
+            photo_archive_core.requests.Request("GET", requested_url).prepare().url
+        )
+        return Response(requested_url)
+
+    monkeypatch.setattr(photo_archive_core.requests.Session, "get", get)
+    session = photo_archive_core.requests.Session()
+    response = photo_archive_core._request_public_response(session, url, timeout=(5, 10))
+    photo_archive_core._close_response(response)
+    session.close()
+
+    assert isinstance(observed["adapter"], photo_archive_core._PinnedAddressAdapter)
+
+
 def test_public_request_disables_environment_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     observed: dict[str, object] = {}
 

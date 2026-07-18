@@ -142,17 +142,25 @@ def _resolve_public_addresses(host: str) -> tuple[str, ...]:
     return tuple(sorted(addresses, key=lambda value: (ipaddress.ip_address(value).version, value)))
 
 
-def _validate_public_url(url: str) -> tuple[str, tuple[str, ...]]:
+def _parse_network_url(url: str):
     parsed = urlparse(url)
     if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
         raise PhotoArchiveError(f"Only public HTTP(S) URLs are supported: {url}")
     if parsed.username is not None or parsed.password is not None:
         raise PhotoArchiveError("Network URLs containing credentials are blocked.")
-    host = parsed.hostname.casefold().rstrip(".")
+    try:
+        host = parsed.hostname.casefold().rstrip(".").encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise PhotoArchiveError(f"Network destination has an invalid host name: {parsed.hostname}") from exc
+    return parsed, host
+
+
+def _validate_public_url(url: str) -> tuple[str, tuple[str, ...]]:
+    _parsed, host = _parse_network_url(url)
     return host, _resolve_public_addresses(host)
 
 
-def _validate_response_peer(response: object) -> None:
+def _validate_response_peer(response: object, expected_addresses: tuple[str, ...] = ()) -> None:
     if not isinstance(response, requests.Response):
         return
     raw = getattr(response, "raw", None)
@@ -164,7 +172,90 @@ def _validate_response_peer(response: object) -> None:
         peer_ip = str(sock.getpeername()[0])
     except (OSError, TypeError, IndexError) as exc:
         raise PhotoArchiveError("Could not verify the network peer for a public request.") from exc
-    _public_ip_address(peer_ip)
+    peer_address = _public_ip_address(peer_ip)
+    if expected_addresses:
+        allowed = {_public_ip_address(value) for value in expected_addresses}
+        if peer_address not in allowed:
+            raise PhotoArchiveError(f"Network peer did not match the validated destination: {peer_address}")
+
+
+class _PinnedAddressAdapter(requests.adapters.HTTPAdapter):
+    """Connect to one validated IP while verifying and addressing the original host."""
+
+    def __init__(self, address: str, host: str, host_header: str) -> None:
+        self.address = str(_public_ip_address(address))
+        self.host = host
+        self.host_header = host_header
+        super().__init__(pool_connections=1, pool_maxsize=1, max_retries=0, pool_block=True)
+
+    def add_headers(self, request, **kwargs) -> None:
+        super().add_headers(request, **kwargs)
+        request.headers["Host"] = self.host_header
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        if proxies:
+            raise PhotoArchiveError("Proxies are disabled for public archive requests.")
+        host_params, pool_kwargs = self.build_connection_pool_key_attributes(request, verify, cert)
+        host_params["host"] = self.address
+        if urlparse(request.url).scheme.casefold() == "https":
+            pool_kwargs["assert_hostname"] = self.host
+            pool_kwargs["server_hostname"] = self.host
+        return self.poolmanager.connection_from_host(**host_params, pool_kwargs=pool_kwargs)
+
+
+def _origin_prefix(url: str) -> str:
+    prepared_url = requests.Request("GET", url).prepare().url or url
+    parsed = urlparse(prepared_url)
+    host = parsed.hostname or ""
+    display_host = f"[{host}]" if ":" in host else host
+    port_suffix = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme.casefold()}://{display_host}{port_suffix}/"
+
+
+def _host_header(url: str) -> str:
+    parsed, host = _parse_network_url(url)
+    display_host = f"[{host}]" if ":" in host else host
+    default_port = 443 if parsed.scheme.casefold() == "https" else 80
+    port_suffix = f":{parsed.port}" if parsed.port and parsed.port != default_port else ""
+    return f"{display_host}{port_suffix}"
+
+
+def _get_pinned_response(
+    session: requests.Session,
+    url: str,
+    addresses: tuple[str, ...],
+    **request_kwargs,
+) -> tuple[object, str]:
+    origin = _origin_prefix(url)
+    previous = session.adapters.get(origin)
+    host = _parse_network_url(url)[1]
+    ordered_addresses = list(addresses)
+    if (
+        isinstance(previous, _PinnedAddressAdapter)
+        and previous.host == host
+        and previous.address in ordered_addresses
+    ):
+        ordered_addresses.remove(previous.address)
+        ordered_addresses.insert(0, previous.address)
+    last_error: Optional[BaseException] = None
+    for address in ordered_addresses:
+        if isinstance(previous, _PinnedAddressAdapter) and previous.address == address:
+            adapter = previous
+        else:
+            adapter = _PinnedAddressAdapter(address, host, _host_header(url))
+            session.mount(origin, adapter)
+            if isinstance(previous, _PinnedAddressAdapter):
+                previous.close()
+            previous = adapter
+        try:
+            return session.get(url, **request_kwargs), adapter.address
+        except requests.RequestException as exc:
+            last_error = exc
+            adapter.close()
+            previous = None
+    if last_error is not None:
+        raise last_error
+    raise PhotoArchiveError(f"Network destination did not resolve: {url}")
 
 
 def _close_response(response: object) -> None:
@@ -263,19 +354,28 @@ def _request_public_response(
         session.trust_env = False
     current_url = url
     for redirect_count in range(MAX_SAME_SITE_REDIRECTS + 1):
-        current_host, _addresses = _validate_public_url(current_url)
+        current_host, addresses = _validate_public_url(current_url)
         if expected_host and not _same_site_host(current_host, expected_host):
             raise PhotoArchiveError(f"{label} redirected outside the official site: {current_url}")
-        response = session.get(
-            current_url,
-            headers=headers,
-            params=params if redirect_count == 0 else None,
-            timeout=timeout,
-            stream=True,
-            allow_redirects=False,
-        )
+        request_kwargs = {
+            "headers": headers,
+            "params": params if redirect_count == 0 else None,
+            "timeout": timeout,
+            "stream": True,
+            "allow_redirects": False,
+        }
+        if isinstance(session, requests.Session):
+            response, connected_address = _get_pinned_response(
+                session,
+                current_url,
+                addresses,
+                **request_kwargs,
+            )
+        else:
+            response = session.get(current_url, **request_kwargs)
+            connected_address = ""
         try:
-            _validate_response_peer(response)
+            _validate_response_peer(response, (connected_address,) if connected_address else ())
             status_code = int(getattr(response, "status_code", 200) or 200)
             if status_code in {301, 302, 303, 307, 308}:
                 location = str(response.headers.get("Location", "")).strip()
@@ -290,9 +390,12 @@ def _request_public_response(
             if status_code not in (allowed_statuses or set()):
                 response.raise_for_status()
             final_url = str(getattr(response, "url", "") or current_url)
-            final_host, _addresses = _validate_public_url(final_url)
+            final_parsed, final_host = _parse_network_url(final_url)
             if expected_host and not _same_site_host(final_host, expected_host):
                 raise PhotoArchiveError(f"{label} redirected outside the official site: {final_url}")
+            current_scheme = urlparse(current_url).scheme.casefold()
+            if final_host != current_host or final_parsed.scheme.casefold() != current_scheme:
+                raise PhotoArchiveError(f"{label} returned an unexpected final URL: {final_url}")
             return response
         except Exception:
             _close_response(response)
