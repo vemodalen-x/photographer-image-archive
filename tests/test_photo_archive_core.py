@@ -18,6 +18,7 @@ from photo_archive_app import (
     THUMBNAIL_WORKERS,
     UI_EVENTS_PER_TICK,
     UI_TICK_BUDGET_SECONDS,
+    _DaemonTaskPool,
     _decode_study_image,
     _gallery_page_window,
     _record_matches_scope,
@@ -378,6 +379,58 @@ def test_public_stream_cancel_closes_a_slow_response(monkeypatch: pytest.MonkeyP
     assert not worker.is_alive()
     assert closed.is_set()
     assert isinstance(result.get("error"), SearchCancelled)
+
+
+def test_process_termination_has_no_unbounded_post_kill_wait() -> None:
+    class StuckProcess:
+        def __init__(self) -> None:
+            self.wait_timeouts: list[float] = []
+            self.terminated = False
+            self.killed = False
+
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self, timeout=None):
+            self.wait_timeouts.append(timeout)
+            raise photo_archive_core.subprocess.TimeoutExpired("renderer", timeout)
+
+    process = StuckProcess()
+    photo_archive_core._terminate_process(process)
+
+    assert process.terminated
+    assert process.killed
+    assert process.wait_timeouts == [2, 2]
+
+
+def test_background_task_pool_uses_daemon_workers_and_cancels_pending_tasks() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    pending_ran = threading.Event()
+    pool = _DaemonTaskPool(max_workers=1, thread_name_prefix="test-photo-pool")
+
+    def active_task() -> None:
+        started.set()
+        release.wait(2)
+
+    pool.submit(active_task)
+    pool.submit(pending_ran.set)
+    assert started.wait(1)
+    assert all(thread.daemon for thread in pool._threads)
+
+    pool.shutdown(wait=False, cancel_futures=True)
+    release.set()
+    for thread in pool._threads:
+        thread.join(timeout=1)
+
+    assert all(not thread.is_alive() for thread in pool._threads)
+    assert not pending_ran.is_set()
 
 
 def test_website_parser_bounds_links_and_candidates() -> None:

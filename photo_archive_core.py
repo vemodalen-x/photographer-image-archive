@@ -1012,7 +1012,10 @@ def _terminate_process(process) -> None:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            return
 
 
 class _DenyProxyHandler(BaseHTTPRequestHandler):
@@ -1041,7 +1044,7 @@ class _DenyProxyServer(ThreadingHTTPServer):
 @contextmanager
 def _deny_proxy():
     server = _DenyProxyServer(("127.0.0.1", 0), _DenyProxyHandler)
-    thread = Thread(target=server.serve_forever, name="photo-archive-deny-proxy")
+    thread = Thread(target=server.serve_forever, name="photo-archive-deny-proxy", daemon=True)
     thread.start()
     try:
         yield f"http://127.0.0.1:{server.server_port}"

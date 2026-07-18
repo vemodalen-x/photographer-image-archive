@@ -9,7 +9,6 @@ import tkinter as tk
 import traceback
 import webbrowser
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -67,6 +66,61 @@ RESULT_SCOPE_OPTIONS = (
     ("待研究", "unreviewed"),
 )
 RESULT_SCOPE_CODES = dict(RESULT_SCOPE_OPTIONS)
+
+
+class _DaemonTaskPool:
+    def __init__(self, max_workers: int, thread_name_prefix: str) -> None:
+        self._tasks: queue.Queue[tuple[object, tuple, dict] | None] = queue.Queue()
+        self._lock = threading.Lock()
+        self._shutdown = False
+        self._threads = [
+            threading.Thread(
+                target=self._run,
+                name=f"{thread_name_prefix}_{index}",
+                daemon=True,
+            )
+            for index in range(max(1, max_workers))
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def submit(self, function, *args, **kwargs) -> None:
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("background task pool is shutting down")
+            self._tasks.put((function, args, kwargs))
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        with self._lock:
+            first_shutdown = not self._shutdown
+            self._shutdown = True
+        if first_shutdown:
+            if cancel_futures:
+                while True:
+                    try:
+                        self._tasks.get_nowait()
+                    except queue.Empty:
+                        break
+                    else:
+                        self._tasks.task_done()
+            for _thread in self._threads:
+                self._tasks.put(None)
+        if wait:
+            for thread in self._threads:
+                thread.join()
+
+    def _run(self) -> None:
+        while True:
+            task = self._tasks.get()
+            try:
+                if task is None:
+                    return
+                function, args, kwargs = task
+                function(*args, **kwargs)
+            except BaseException:
+                traceback.print_exc()
+            finally:
+                self._tasks.task_done()
 
 
 def _resource_path(relative_path: str) -> Path:
@@ -487,8 +541,8 @@ class PhotoArchiveApp(tk.Tk):
         self.thumbnail_images: OrderedDict[str, object] = OrderedDict()
         self.list_thumbnail_images: OrderedDict[str, object] = OrderedDict()
         self.thumbnail_loading: set[str] = set()
-        self.thumbnail_executor = ThreadPoolExecutor(max_workers=THUMBNAIL_WORKERS, thread_name_prefix="photo-thumb")
-        self.preview_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="photo-preview")
+        self.thumbnail_executor = _DaemonTaskPool(max_workers=THUMBNAIL_WORKERS, thread_name_prefix="photo-thumb")
+        self.preview_executor = _DaemonTaskPool(max_workers=2, thread_name_prefix="photo-preview")
         self.worker_thread: threading.Thread | None = None
         self.shutdown_thread: threading.Thread | None = None
         self.cancel_event = threading.Event()
@@ -518,7 +572,7 @@ class PhotoArchiveApp(tk.Tk):
         self.study_image_cache: OrderedDict[str, bytes] = OrderedDict()
         self.study_cache_bytes = 0
         self.study_cache_lock = threading.Lock()
-        self.study_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="photo-study")
+        self.study_executor = _DaemonTaskPool(max_workers=3, thread_name_prefix="photo-study")
 
         self.photographer_var = tk.StringVar(value="Michael Christopher Brown")
         self.website_url_var = tk.StringVar(value="")
@@ -1511,7 +1565,7 @@ class PhotoArchiveApp(tk.Tk):
         self.worker_thread = threading.Thread(
             target=self._archive_worker,
             args=(photographer, output_dir, website_url, limit, download_limit, min_edge, download),
-            daemon=False,
+            daemon=True,
         )
         self.worker_thread.start()
 
@@ -2613,7 +2667,7 @@ class PhotoArchiveApp(tk.Tk):
         self.shutdown_thread = threading.Thread(
             target=self._wait_for_background_shutdown,
             name="photo-archive-shutdown",
-            daemon=False,
+            daemon=True,
         )
         self.shutdown_thread.start()
 
