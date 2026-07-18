@@ -1638,7 +1638,7 @@ class PhotoArchiveApp(tk.Tk):
         self.detail_var.set(f"准备下载 {len(allowed)} 张图片。")
         self._stop_indeterminate_progress()
         self._set_progress(0)
-        self.worker_thread = threading.Thread(target=self._download_records_worker, args=(allowed, output_dir), daemon=False)
+        self.worker_thread = threading.Thread(target=self._download_records_worker, args=(allowed, output_dir), daemon=True)
         self.worker_thread.start()
 
     def _download_records_worker(self, records: list[PhotoRecord], output_dir: Path) -> None:
@@ -2720,7 +2720,7 @@ def main(argv: list[str] | None = None) -> int:
         probe = threading.Thread(
             target=lambda: app.shutdown_event.wait(5),
             name="photo-archive-ui-smoke-worker",
-            daemon=False,
+            daemon=True,
         )
         app.worker_thread = probe
         probe.start()

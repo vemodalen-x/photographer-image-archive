@@ -433,6 +433,45 @@ def test_background_task_pool_uses_daemon_workers_and_cancels_pending_tasks() ->
     assert not pending_ran.is_set()
 
 
+def test_manual_download_worker_is_daemon(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    record = PhotoRecord(
+        source="website",
+        source_id="manual-download",
+        search_name="Example",
+        title="Manual download",
+        page_url="https://example.test/work/manual",
+        image_url="https://example.test/work/manual.jpg",
+    )
+
+    def blocked_worker(_records, _output_dir) -> None:
+        started.set()
+        release.wait(2)
+
+    app = SimpleNamespace(
+        skipped_records=set(),
+        output_dir_var=SimpleNamespace(get=lambda: str(tmp_path)),
+        cancel_event=threading.Event(),
+        search_started_at=0.0,
+        phase_var=SimpleNamespace(set=lambda _value: None),
+        detail_var=SimpleNamespace(set=lambda _value: None),
+        _set_busy=lambda _value: None,
+        _stop_indeterminate_progress=lambda: None,
+        _set_progress=lambda _value: None,
+        _download_records_worker=blocked_worker,
+        worker_thread=None,
+    )
+
+    photo_archive_app.PhotoArchiveApp._start_record_download(app, [record])
+    assert started.wait(1)
+    assert app.worker_thread.daemon
+
+    release.set()
+    app.worker_thread.join(timeout=1)
+    assert not app.worker_thread.is_alive()
+
+
 def test_website_parser_bounds_links_and_candidates() -> None:
     parser = photo_archive_core._WebsiteImageParser(
         "https://example.test/",
