@@ -1,0 +1,23 @@
+# SHA-256 source lock consumed by tools/create_locked_conda_env.ps1.
+# platform: win-64
+@EXPLICIT
+https://repo.anaconda.com/pkgs/main/win-64/ca-certificates-2026.5.14-haa95532_0.conda#cd677eba8e5005c16d6c0926b3a6ee54e4a0a466bb1ae8071e6fc49cbd65ad29
+https://repo.anaconda.com/pkgs/main/noarch/tzdata-2026c-he532380_0.conda#52adc4b0a9cce2ffb8ad319d54b7c940ae7961f7caf7ce6851eec4b3f542c368
+https://repo.anaconda.com/pkgs/main/win-64/ucrt-10.0.22621.0-haa95532_0.conda#9dfca4fb23f20e62a48b9c52e2fdf4d0d34bb31eb6a930c2195fcd10651b3cc3
+https://repo.anaconda.com/pkgs/main/win-64/vc14_runtime-14.44.35208-h4927774_12.conda#492ba65a50d99120e047469057f5eaddd3043cf17a18761653d1b3ae5d9d6c84
+https://repo.anaconda.com/pkgs/main/win-64/vc-14.3-h2df5915_12.conda#81f68bd3f7e74032547fc3c2b1d7d914b2688cc11f2470625c5c65d49d1474bd
+https://repo.anaconda.com/pkgs/main/win-64/vs2015_runtime-14.44.35208-ha6b5a95_12.conda#5b484a4b7df0133f60fd9e12dcf1926f868eaa34a2c3ddad8475169a1a99d9fa
+https://repo.anaconda.com/pkgs/main/win-64/bzip2-1.0.8-h2bbff1b_6.conda#4e30c9bfd4501555b0859c863e95ea044290babf3bf190b9d4fb38b06cf15c3c
+https://repo.anaconda.com/pkgs/main/win-64/libexpat-2.8.2-hd7fb8db_1.conda#a4f6a14ae8fd1f754c7508ab509fcf90cabbb26ce5228d8bee51ec9f69b3ac40
+https://repo.anaconda.com/pkgs/main/win-64/libffi-3.4.8-h42d73b9_3.conda#52fa61549a14619aa53c0ae875f6d969fd97c92edffce64bfd7277e2557a726e
+https://repo.anaconda.com/pkgs/main/win-64/libzlib-1.3.2-h1c6eee0_0.conda#ee9ff49405717b96ec8d9b586beaaf96b741ffc4d37df6623f1d599ab8bdbb14
+https://repo.anaconda.com/pkgs/main/win-64/openssl-3.5.7-hbb43b14_0.conda#e7ab91ad870e305f8bd926e6a9298096cb1e920cedb48d720b8d4f9580b6291a
+https://repo.anaconda.com/pkgs/main/win-64/sqlite-3.53.2-hee5a0db_0.conda#2810e058702910c30cdfab5190090d8f4bb384870a5526980f437475567ed704
+https://repo.anaconda.com/pkgs/main/win-64/xz-5.8.2-h53af0af_0.conda#e09005f52c41234213bd52ebd07092d945855b6d631dd709dcf35dbc71a15c63
+https://repo.anaconda.com/pkgs/main/win-64/zlib-1.3.2-h1c6eee0_0.conda#538f7c9b5ed6fa388c51bd499c736fd474826bcd7f2908456e9d2050b486e476
+https://repo.anaconda.com/pkgs/main/win-64/tk-8.6.15-hf199647_0.conda#2f7e9d06b513bcabce6d9ae195e45ccf94fd249edfefc591a5430a9f6f92a7fa
+https://repo.anaconda.com/pkgs/main/win-64/python-3.12.13-hd7b1df3_3.conda#6c6862152ca12711eaf2efb6dbfd50cdf773266ac63ab630fc7ef905ab955ac5
+https://repo.anaconda.com/pkgs/main/win-64/packaging-26.0-py312haa95532_0.conda#032a329740f00f4ef3ae6d6c26847b6a9a95e85cfe8f0787bcab3497cbbd4aeb
+https://repo.anaconda.com/pkgs/main/win-64/setuptools-83.0.0-py312haa95532_0.conda#fe020c48f79b0eac8d4cece368226d46f8bd1b1dc37a7666b591e31b5977bf25
+https://repo.anaconda.com/pkgs/main/win-64/wheel-0.47.0-py312haa95532_0.conda#df4602884a5ba42105bcdccdccad37c29c26d4d2bda4b94916e0cc72a7c4bc3e
+https://repo.anaconda.com/pkgs/main/noarch/pip-26.1.2-pyhc872135_0.conda#fe4396e88d44b9df60ebc911505b3902d0754439c2cf4fc0d2c6bfc281ee05e8

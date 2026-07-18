@@ -143,15 +143,18 @@ def _resolve_public_addresses(host: str) -> tuple[str, ...]:
 
 
 def _parse_network_url(url: str):
-    parsed = urlparse(url)
-    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+    raw_parsed = urlparse(url)
+    if raw_parsed.scheme.casefold() not in {"http", "https"} or not raw_parsed.hostname:
         raise PhotoArchiveError(f"Only public HTTP(S) URLs are supported: {url}")
-    if parsed.username is not None or parsed.password is not None:
+    if raw_parsed.username is not None or raw_parsed.password is not None:
         raise PhotoArchiveError("Network URLs containing credentials are blocked.")
     try:
-        host = parsed.hostname.casefold().rstrip(".").encode("idna").decode("ascii")
-    except UnicodeError as exc:
-        raise PhotoArchiveError(f"Network destination has an invalid host name: {parsed.hostname}") from exc
+        prepared_url = requests.Request("GET", url).prepare().url or url
+        parsed = urlparse(prepared_url)
+        host = (parsed.hostname or "").casefold().rstrip(".")
+        parsed.port
+    except (UnicodeError, ValueError, requests.RequestException) as exc:
+        raise PhotoArchiveError(f"Network destination has an invalid host name: {raw_parsed.hostname}") from exc
     return parsed, host
 
 
@@ -204,8 +207,7 @@ class _PinnedAddressAdapter(requests.adapters.HTTPAdapter):
 
 
 def _origin_prefix(url: str) -> str:
-    prepared_url = requests.Request("GET", url).prepare().url or url
-    parsed = urlparse(prepared_url)
+    parsed, _host = _parse_network_url(url)
     host = parsed.hostname or ""
     display_host = f"[{host}]" if ":" in host else host
     port_suffix = f":{parsed.port}" if parsed.port else ""
@@ -218,6 +220,34 @@ def _host_header(url: str) -> str:
     default_port = 443 if parsed.scheme.casefold() == "https" else 80
     port_suffix = f":{parsed.port}" if parsed.port and parsed.port != default_port else ""
     return f"{display_host}{port_suffix}"
+
+
+def _send_pinned_get(session: requests.Session, url: str, **request_kwargs):
+    if request_kwargs.pop("allow_redirects", False):
+        raise PhotoArchiveError("Automatic redirects are disabled for public archive requests.")
+    if request_kwargs.pop("stream", True) is not True:
+        raise PhotoArchiveError("Public archive requests must use streaming responses.")
+    timeout = request_kwargs.pop("timeout")
+    request = requests.Request(
+        "GET",
+        url,
+        headers=request_kwargs.pop("headers", None),
+        params=request_kwargs.pop("params", None),
+    )
+    if request_kwargs:
+        raise PhotoArchiveError(f"Unsupported public request options: {', '.join(sorted(request_kwargs))}")
+    prepared = session.prepare_request(request)
+    adapter = session.get_adapter(prepared.url)
+    response = adapter.send(
+        prepared,
+        timeout=timeout,
+        stream=True,
+        verify=session.verify,
+        cert=session.cert,
+        proxies={},
+    )
+    requests.cookies.extract_cookies_to_jar(session.cookies, prepared, response.raw)
+    return response
 
 
 def _get_pinned_response(
@@ -248,7 +278,7 @@ def _get_pinned_response(
                 previous.close()
             previous = adapter
         try:
-            return session.get(url, **request_kwargs), adapter.address
+            return _send_pinned_get(session, url, **request_kwargs), adapter.address
         except requests.RequestException as exc:
             last_error = exc
             adapter.close()
@@ -390,11 +420,10 @@ def _request_public_response(
             if status_code not in (allowed_statuses or set()):
                 response.raise_for_status()
             final_url = str(getattr(response, "url", "") or current_url)
-            final_parsed, final_host = _parse_network_url(final_url)
+            _final_parsed, final_host = _parse_network_url(final_url)
             if expected_host and not _same_site_host(final_host, expected_host):
                 raise PhotoArchiveError(f"{label} redirected outside the official site: {final_url}")
-            current_scheme = urlparse(current_url).scheme.casefold()
-            if final_host != current_host or final_parsed.scheme.casefold() != current_scheme:
+            if final_host != current_host or _origin_prefix(final_url) != _origin_prefix(current_url):
                 raise PhotoArchiveError(f"{label} returned an unexpected final URL: {final_url}")
             return response
         except Exception:
@@ -2158,8 +2187,6 @@ class WikimediaCommonsSource:
             ext.get("CreditLine"),
             ext.get("Permission"),
             ext.get("UsageTerms"),
-            merged_metadata.get("UserComment"),
-            merged_metadata.get("XPComment"),
         )
         author = _first_non_empty(ext.get("Artist"), merged_metadata.get("Artist"), ext.get("Attribution"))
 
@@ -2714,10 +2741,20 @@ def _canonical_page_url(url: str) -> str:
 
 def _same_site_host(left: str, right: str) -> bool:
     def normalized(value: str) -> str:
-        host = value.casefold().rsplit("@", 1)[-1].split(":", 1)[0].strip(".")
+        candidate = value.strip()
+        if "://" not in candidate:
+            if candidate.count(":") > 1 and not candidate.startswith("["):
+                candidate = f"[{candidate}]"
+            candidate = f"https://{candidate}"
+        try:
+            host = _parse_network_url(candidate)[1]
+        except PhotoArchiveError:
+            return ""
         return host.removeprefix("www.")
 
-    return bool(normalized(left)) and normalized(left) == normalized(right)
+    left_host = normalized(left)
+    right_host = normalized(right)
+    return bool(left_host) and left_host == right_host
 
 
 def _collection_title_from_page(page_title: str, search_name: str, page_url: str) -> str:
@@ -3098,6 +3135,8 @@ def _destination_for_record(record: PhotoRecord, image_dir: Path) -> Path:
 def _extract_extmetadata(raw: dict) -> dict[str, str]:
     result: dict[str, str] = {}
     for key, payload in raw.items():
+        if _private_metadata_key(key):
+            continue
         if isinstance(payload, dict):
             value = payload.get("value", "")
         else:
@@ -3112,13 +3151,27 @@ def _metadata_list_to_map(raw: list) -> dict[str, str]:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or "").strip()
-        if not name:
+        if not name or _private_metadata_key(name):
             continue
         value = item.get("value", "")
         if isinstance(value, (list, tuple)):
             value = ", ".join(str(part) for part in value)
         result[name] = html_to_text(value)
     return result
+
+
+def _private_metadata_key(value: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(value).casefold())
+    return "gps" in normalized or normalized in {
+        "bodyserialnumber",
+        "cameraownername",
+        "lensserialnumber",
+        "makernote",
+        "ownername",
+        "serialnumber",
+        "usercomment",
+        "xpcomment",
+    }
 
 
 def _file_title_to_name(value: str) -> str:

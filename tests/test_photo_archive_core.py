@@ -112,7 +112,7 @@ def test_download_binary_rejects_declared_oversized_image(tmp_path: Path, monkey
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr(photo_archive_core.requests.Session, "get", lambda *_args, **_kwargs: OversizedResponse())
+    monkeypatch.setattr(photo_archive_core, "_send_pinned_get", lambda *_args, **_kwargs: OversizedResponse())
     destination = tmp_path / "oversized.part"
 
     with pytest.raises(photo_archive_core.PhotoArchiveError, match="512 MiB"):
@@ -256,7 +256,7 @@ def test_download_rejects_private_redirect_before_target_request(tmp_path: Path,
         requested.append(url)
         return RedirectResponse()
 
-    monkeypatch.setattr(photo_archive_core.requests.Session, "get", get)
+    monkeypatch.setattr(photo_archive_core, "_send_pinned_get", get)
     with pytest.raises(photo_archive_core.PhotoArchiveError, match="non-public network destination"):
         _download_binary("https://example.test/image.jpg", tmp_path / "image.part")
 
@@ -315,6 +315,29 @@ def test_pinned_adapter_connects_to_validated_ip_with_original_tls_identity() ->
     adapter.close()
 
 
+def test_network_validation_uses_requests_uts46_idn_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolved: list[str] = []
+
+    def resolve(host: str) -> tuple[str, ...]:
+        resolved.append(host)
+        return ("93.184.216.34",)
+
+    monkeypatch.setattr(photo_archive_core, "_resolve_public_addresses", resolve)
+    host, addresses = photo_archive_core._validate_public_url("https://faß.de/gallery")
+
+    assert host == "xn--fa-hia.de"
+    assert addresses == ("93.184.216.34",)
+    assert resolved == ["xn--fa-hia.de"]
+    assert photo_archive_core._origin_prefix("https://faß.de/gallery") == "https://xn--fa-hia.de/"
+    assert photo_archive_core._host_header("https://faß.de/gallery") == "xn--fa-hia.de"
+    assert photo_archive_core._same_site_host("faß.de", "xn--fa-hia.de")
+
+
+def test_same_site_host_compares_complete_ipv6_addresses() -> None:
+    assert photo_archive_core._same_site_host("2001:4860:4860::8888", "[2001:4860:4860::8888]")
+    assert not photo_archive_core._same_site_host("2001:4860:4860::8888", "2001:4860:4860::8844")
+
+
 def test_public_request_does_not_reresolve_hostname_during_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     resolutions: list[str] = []
     observed: dict[str, object] = {}
@@ -341,7 +364,7 @@ def test_public_request_does_not_reresolve_hostname_during_dispatch(monkeypatch:
         return Response()
 
     monkeypatch.setattr(photo_archive_core.socket, "getaddrinfo", getaddrinfo)
-    monkeypatch.setattr(photo_archive_core.requests.Session, "get", get)
+    monkeypatch.setattr(photo_archive_core, "_send_pinned_get", get)
     session = photo_archive_core.requests.Session()
     response = photo_archive_core._request_public_response(
         session,
@@ -387,13 +410,59 @@ def test_pinned_adapter_covers_noncanonical_public_url_origins(
         )
         return Response(requested_url)
 
-    monkeypatch.setattr(photo_archive_core.requests.Session, "get", get)
+    monkeypatch.setattr(photo_archive_core, "_send_pinned_get", get)
     session = photo_archive_core.requests.Session()
     response = photo_archive_core._request_public_response(session, url, timeout=(5, 10))
     photo_archive_core._close_response(response)
     session.close()
 
     assert isinstance(observed["adapter"], photo_archive_core._PinnedAddressAdapter)
+
+
+def test_redirect_response_body_is_not_read_before_target_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[str] = []
+
+    class Socket:
+        def getpeername(self):
+            return ("93.184.216.34", 443)
+
+    class Raw:
+        _connection = SimpleNamespace(sock=Socket())
+
+        def __init__(self) -> None:
+            self.read_called = False
+
+        def read(self, *_args, **_kwargs):
+            self.read_called = True
+            raise AssertionError("redirect body must not be consumed")
+
+        def close(self) -> None:
+            return None
+
+        def release_conn(self) -> None:
+            return None
+
+    raw = Raw()
+    response = photo_archive_core.requests.Response()
+    response.status_code = 302
+    response.url = "https://example.test/start"
+    response.headers["Location"] = "http://127.0.0.1/private"
+    response.raw = raw
+
+    def send(_session, url: str, **_kwargs):
+        sent.append(url)
+        return response
+
+    monkeypatch.setattr(photo_archive_core, "_send_pinned_get", send)
+    with pytest.raises(photo_archive_core.PhotoArchiveError, match="non-public network destination"):
+        photo_archive_core._request_public_response(
+            photo_archive_core.requests.Session(),
+            "https://example.test/start",
+            timeout=(5, 10),
+        )
+
+    assert sent == ["https://example.test/start"]
+    assert raw.read_called is False
 
 
 def test_public_request_disables_environment_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -416,7 +485,7 @@ def test_public_request_disables_environment_proxy(monkeypatch: pytest.MonkeyPat
         return Response()
 
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
-    monkeypatch.setattr(photo_archive_core.requests.Session, "get", get)
+    monkeypatch.setattr(photo_archive_core, "_send_pinned_get", get)
     session = photo_archive_core.requests.Session()
     response = photo_archive_core._request_public_response(
         session,
@@ -455,8 +524,8 @@ def test_public_stream_cancel_closes_a_slow_response(monkeypatch: pytest.MonkeyP
             closed.set()
 
     monkeypatch.setattr(
-        photo_archive_core.requests.Session,
-        "get",
+        photo_archive_core,
+        "_send_pinned_get",
         lambda *_args, **_kwargs: SlowResponse(),
     )
     cancel_event = threading.Event()
@@ -1411,6 +1480,49 @@ def test_commons_source_rejects_general_text_match_without_attribution() -> None
     assert result.records[0].match_confidence == 100
     assert result.rejected_irrelevant == 1
     assert "record_rejected" in events
+
+
+def test_commons_record_filters_private_camera_metadata() -> None:
+    page = {
+        "pageid": 42,
+        "title": "File:example.jpg",
+        "categories": [{"title": "Category:Research"}],
+        "imageinfo": [
+            {
+                "url": "https://upload.example/example.jpg",
+                "descriptionurl": "https://commons.example/example",
+                "thumburl": "https://upload.example/example-thumb.jpg",
+                "width": 2400,
+                "height": 1600,
+                "mime": "image/jpeg",
+                "size": 1234,
+                "extmetadata": {
+                    "Artist": {"value": "Example Photographer"},
+                    "CreditLine": {"value": "Example credit"},
+                    "GPSLatitude": {"value": "1.234"},
+                    "GPSLongitude": {"value": "5.678"},
+                },
+                "metadata": [
+                    {"name": "UserComment", "value": "private note"},
+                    {"name": "Composite:GPSPosition", "value": "1.234, 5.678"},
+                    {"name": "BodySerialNumber", "value": "ABC123"},
+                    {"name": "Model", "value": "Research Camera"},
+                ],
+                "commonmetadata": [{"name": "XPComment", "value": "hidden note"}],
+            }
+        ],
+    }
+
+    record = WikimediaCommonsSource()._record_from_page(page, "Example Photographer")
+
+    assert record is not None
+    assert record.source_comment == "Example credit"
+    assert record.camera_model == "Research Camera"
+    raw = record.raw_metadata_json.casefold()
+    assert "gps" not in raw
+    assert "private note" not in raw
+    assert "hidden note" not in raw
+    assert "abc123" not in raw
 
 
 def test_archive_uses_auto_discovered_official_site_when_url_is_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

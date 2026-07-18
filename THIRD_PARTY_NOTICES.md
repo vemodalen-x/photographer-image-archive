@@ -9,6 +9,6 @@ The release includes the applicable license and notice texts under `THIRD_PARTY_
 - Typing Extensions: `TYPING_EXTENSIONS.txt`.
 - CPython and Tcl/Tk: `PYTHON.txt` and `TCL-TK.txt`.
 - Expat XML parser: `EXPAT.txt`.
-- Runtime libraries distributed with the Windows build: `OPENSSL.txt`, `ZLIB.txt`, `BZIP2.txt`, `XZ.txt`, `LIBFFI.txt`, and `SQLITE.txt`.
+- Runtime libraries distributed with the Windows build: `OPENSSL.txt`, `ZLIB.txt`, `BZIP2.txt`, `XZ.txt`, `XZ-0BSD.txt`, `XZ-GPL-2.0.txt`, `LIBFFI.txt`, and `SQLITE.txt`.
 
 Photographs discovered or downloaded by the application are not part of this software license. Their rights and permitted uses remain governed by the source website, credited creator, and recorded license metadata.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sys
 import zipfile
 from importlib.metadata import distribution
 from pathlib import Path
@@ -27,6 +28,15 @@ EXPECTED_FILES = {
 EXPECTED_FILES.update(
     {f"THIRD_PARTY_LICENSES/{name}": f"license for {name}".encode() for name in THIRD_PARTY_LICENSE_FILES}
 )
+RUNTIME_LICENSE_HASHES = {
+    "LIBFFI.txt": "67894089811f93fca47a76f85e017da6f8582d4ba0905963c6e0f1ad6df7a195",
+    "PYINSTALLER.txt": "dcf75fdb959db1e3b41c0f8505069d2ece781b5ec6b3d0a4d30975cfc6580245",
+    "TCL-TK.txt": "2cde822b93ca16ae535c954b7dfe658b4ad10df2a193628d1b358f1765e8b198",
+    "XZ.txt": "616a3ad264ce29b8f1cb97e53037b139d406899ca8d1f799651e17bfa09830b8",
+    "XZ-0BSD.txt": "0b01625d853911cd0e2e088dcfb743261034a091bb379246cb25a14cc4c74bf1",
+    "XZ-GPL-2.0.txt": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6",
+    "ZLIB.txt": "e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2",
+}
 
 
 def _package(tmp_path: Path, files: dict[str, bytes] | None = None) -> tuple[Path, Path]:
@@ -181,6 +191,34 @@ def test_pillow_license_matches_locked_distribution_bytes() -> None:
     ).read_bytes()
 
 
+@pytest.mark.parametrize(("name", "expected_hash"), sorted(RUNTIME_LICENSE_HASHES.items()))
+def test_runtime_license_bytes_match_locked_components(name: str, expected_hash: str) -> None:
+    root = Path(__file__).resolve().parents[1]
+    data = (root / "THIRD_PARTY_LICENSES" / name).read_bytes()
+
+    assert hashlib.sha256(data).hexdigest() == expected_hash
+
+
+@pytest.mark.parametrize(
+    ("name", "source"),
+    [
+        ("PYINSTALLER.txt", Path("Lib/site-packages/pyinstaller-6.21.0.dist-info/licenses/COPYING.txt")),
+        ("TCL-TK.txt", Path("Library/lib/tk8.6/license.terms")),
+        ("XZ.txt", Path("Library/share/doc/xz/COPYING")),
+        ("XZ-0BSD.txt", Path("Library/share/doc/xz/COPYING.0BSD")),
+        ("XZ-GPL-2.0.txt", Path("Library/share/doc/xz/COPYING.GPLv2")),
+        ("ZLIB.txt", Path("Library/share/doc/zlib/zlib/LICENSE")),
+    ],
+)
+def test_runtime_license_matches_locked_environment_bytes(name: str, source: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    environment_source = Path(sys.prefix) / source
+
+    if not environment_source.is_file():
+        pytest.skip("exact runtime license source is available in the locked Windows release environment")
+    assert (root / "THIRD_PARTY_LICENSES" / name).read_bytes() == environment_source.read_bytes()
+
+
 def test_release_workflow_pins_actions_and_limits_write_permission() -> None:
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github" / "workflows" / "windows-release.yml").read_text(encoding="utf-8")
@@ -194,6 +232,37 @@ def test_release_workflow_pins_actions_and_limits_write_permission() -> None:
     assert f"dist/SHA256SUMS-v{VERSION}.txt" in workflow
     assert "dist/PhotographerImageArchive-*" not in workflow
     assert "dist/SHA256SUMS-v*" not in workflow
+    assert "runs-on: windows-2025" in workflow
+    assert "windows-latest" not in workflow
+    assert "runs-on: ubuntu-24.04" in workflow
+    assert "ubuntu-latest" not in workflow
+    assert "setup-python" not in workflow
+    assert "conda-incubator/setup-miniconda" not in workflow
+    assert "Miniconda3-py312_25.5.1-1-Windows-x86_64.exe" in workflow
+    assert "0905638dcd7bb214261fe0ac6136d4dbbb9c4266fa3cf4c5bf4ffce834ae5357" in workflow
+    assert "tools\\create_locked_conda_env.ps1" in workflow
+    assert ".venv-release\\python.exe" in workflow
+
+
+def test_windows_runtime_lock_uses_exact_artifacts() -> None:
+    root = Path(__file__).resolve().parents[1]
+    bootstrap = (root / "tools" / "create_locked_conda_env.ps1").read_text(encoding="utf-8")
+    lines = [
+        line.strip()
+        for line in (root / "environment-release-win-64.lock").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+
+    assert lines[0] == "@EXPLICIT"
+    assert len(lines) == 21
+    assert all(re.fullmatch(r"https://repo\.anaconda\.com/.+\.conda#[0-9a-f]{64}", line) for line in lines[1:])
+    assert any(
+        "/python-3.12.13-hd7b1df3_3.conda#6c6862152ca12711eaf2efb6dbfd50cdf773266ac63ab630fc7ef905ab955ac5"
+        in line
+        for line in lines
+    )
+    assert "environment-release-win-64.lock" in bootstrap
+    assert "Algorithm SHA256" in bootstrap
 
 
 def test_repository_enforces_lf_for_public_text() -> None:

@@ -16,6 +16,7 @@ VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 PRODUCT_BASENAME = "PhotographerImageArchive"
 PACKAGE_ROOT_NAME = f"{PRODUCT_BASENAME}-{VERSION}-windows-x64"
 PUBLIC_DOCUMENTS = ("README.md", "LICENSE", "CHANGELOG.md", "PRIVACY.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md")
+RELEASE_PYTHON_VERSION = (3, 12, 13)
 
 
 def _remove_generated(path: Path) -> None:
@@ -53,6 +54,9 @@ def _write_deterministic_zip(source_dir: Path, destination: Path) -> None:
 def build() -> tuple[Path, Path]:
     if os.name != "nt":
         raise RuntimeError("The Windows release must be built on Windows.")
+    if tuple(sys.version_info[:3]) != RELEASE_PYTHON_VERSION:
+        expected = ".".join(str(part) for part in RELEASE_PYTHON_VERSION)
+        raise RuntimeError(f"The Windows release requires Python {expected} exactly.")
     violations = audit_source(ROOT)
     if violations:
         raise RuntimeError("public source audit failed:\n" + "\n".join(violations))

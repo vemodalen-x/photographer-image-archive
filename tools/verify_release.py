@@ -62,6 +62,8 @@ THIRD_PARTY_LICENSE_FILES = {
     "TYPING_EXTENSIONS.txt",
     "URLLIB3.txt",
     "XZ.txt",
+    "XZ-0BSD.txt",
+    "XZ-GPL-2.0.txt",
     "ZLIB.txt",
 }
 
