@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Made live gallery refreshes deadline-based so a continuous result stream cannot delay the first visible cards.
+- Batched and bounded activity-log rendering to keep large portfolio crawls responsive.
+- Restored the previous photographer, archive directory, retrieval options, and preferred result view on launch.
+- Bound restored and manually entered official-site URLs to their photographer so a later name change cannot reuse the wrong site.
+- Made unexpected interface errors non-blocking while retaining diagnostics in the activity log.
+- Reduced large-library reset work and added clearer searching and empty-result states.
+
 ## 1.0.0 - 2026-07-18
 
 - Added verified official-site discovery with bounded same-origin gallery crawling.

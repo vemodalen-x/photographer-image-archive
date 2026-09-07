@@ -154,6 +154,170 @@ def test_ui_event_pump_reschedules_after_handler_failure() -> None:
     assert scheduled
 
 
+def test_gallery_reflow_coalesces_without_postponing_first_render() -> None:
+    scheduled: list[tuple[int, object]] = []
+
+    def callback() -> None:
+        return None
+
+    harness = SimpleNamespace(
+        gallery_reflow_after=None,
+        _reflow_gallery=callback,
+        after=lambda delay, callback: scheduled.append((delay, callback)) or "reflow-1",
+    )
+
+    photo_archive_app.PhotoArchiveApp._schedule_gallery_reflow(harness)
+    photo_archive_app.PhotoArchiveApp._schedule_gallery_reflow(harness)
+
+    assert scheduled == [(photo_archive_app.GALLERY_REFLOW_DELAY_MS, callback)]
+
+
+def test_result_summary_refresh_coalesces_live_record_bursts() -> None:
+    scheduled: list[tuple[int, object]] = []
+
+    def callback() -> None:
+        return None
+
+    harness = SimpleNamespace(
+        result_summary_after=None,
+        _refresh_result_summary=callback,
+        after=lambda delay, target: scheduled.append((delay, target)) or "summary-1",
+    )
+
+    photo_archive_app.PhotoArchiveApp._schedule_result_summary_refresh(harness)
+    photo_archive_app.PhotoArchiveApp._schedule_result_summary_refresh(harness)
+
+    assert scheduled == [(photo_archive_app.RESULT_SUMMARY_DELAY_MS, callback)]
+
+
+def test_activity_log_batches_hidden_updates_and_caps_rendered_lines() -> None:
+    class LogWidget:
+        def __init__(self) -> None:
+            self.inserted: list[str] = []
+            self.deleted: list[tuple[str, str]] = []
+            self.seen = 0
+
+        def insert(self, _position: str, value: str) -> None:
+            self.inserted.append(value)
+
+        def delete(self, start: str, end: str) -> None:
+            self.deleted.append((start, end))
+
+        def see(self, _position: str) -> None:
+            self.seen += 1
+
+    scheduled: list[tuple[int, object]] = []
+
+    def callback() -> None:
+        return None
+
+    widget = LogWidget()
+    harness = SimpleNamespace(
+        pending_log_lines=[],
+        log_flush_after=None,
+        rendered_log_lines=photo_archive_app.MAX_LOG_LINES - 1,
+        log_visible=False,
+        log_text=widget,
+        _flush_log_lines=callback,
+        after=lambda delay, target: scheduled.append((delay, target)) or "log-1",
+    )
+
+    photo_archive_app.PhotoArchiveApp._log(harness, "first")
+    photo_archive_app.PhotoArchiveApp._log(harness, "second")
+    assert len(scheduled) == 1
+    assert widget.inserted == []
+
+    photo_archive_app.PhotoArchiveApp._flush_log_lines(harness)
+
+    assert len(widget.inserted) == 1
+    assert "first" in widget.inserted[0] and "second" in widget.inserted[0]
+    assert widget.deleted == [("1.0", "2.0")]
+    assert harness.rendered_log_lines == photo_archive_app.MAX_LOG_LINES
+    assert widget.seen == 0
+
+
+def test_preferences_round_trip_and_clamp_untrusted_values(tmp_path: Path) -> None:
+    path = tmp_path / "settings" / "preferences.json"
+    photo_archive_app._write_preferences(
+        path,
+        {
+            "version": photo_archive_app.PREFERENCES_VERSION,
+            "photographer": "  Example Photographer  ",
+            "website_url": "https://example.test/portfolio",
+            "output_dir": "archive",
+            "limit": 99999,
+            "download_limit": -20,
+            "min_edge": "invalid",
+            "download": True,
+            "view_mode": "unknown",
+            "advanced_visible": True,
+            "website_is_auto": True,
+        },
+    )
+
+    preferences = photo_archive_app._load_preferences(path)
+
+    assert preferences["photographer"] == "Example Photographer"
+    assert preferences["limit"] == 5000
+    assert preferences["download_limit"] == 0
+    assert preferences["min_edge"] == photo_archive_core.DEFAULT_MIN_LONG_EDGE
+    assert preferences["view_mode"] == "grid"
+    assert preferences["download"] is True
+    assert not path.with_suffix(".json.tmp").exists()
+
+
+@pytest.mark.parametrize("content", ["not json", "[]", '{"version": 999}'])
+def test_preferences_ignore_corrupt_or_unknown_documents(tmp_path: Path, content: str) -> None:
+    path = tmp_path / "preferences.json"
+    path.write_text(content, encoding="utf-8")
+
+    assert photo_archive_app._load_preferences(path) == {}
+
+
+def test_preferences_ignore_oversized_documents_and_non_string_paths(tmp_path: Path) -> None:
+    oversized = tmp_path / "oversized.json"
+    oversized.write_text(" " * (photo_archive_app.MAX_PREFERENCES_BYTES + 1), encoding="utf-8")
+    wrong_types = tmp_path / "wrong-types.json"
+    wrong_types.write_text(
+        '{"version": 1, "photographer": ["wrong"], "website_url": 42, "output_dir": {}}',
+        encoding="utf-8",
+    )
+
+    assert photo_archive_app._load_preferences(oversized) == {}
+    preferences = photo_archive_app._load_preferences(wrong_types)
+    assert preferences["photographer"] == ""
+    assert preferences["website_url"] == ""
+    assert preferences["output_dir"] == ""
+
+
+def test_changing_photographer_clears_url_owned_by_previous_search() -> None:
+    cleared: list[tuple[str, str]] = []
+    harness = SimpleNamespace(
+        website_url_var=SimpleNamespace(get=lambda: "https://previous.example.test/"),
+        photographer_var=SimpleNamespace(get=lambda: "New Photographer"),
+        website_url_name="Previous Photographer",
+        _set_auto_website_url=lambda url, photographer: cleared.append((url, photographer)),
+    )
+
+    photo_archive_app.PhotoArchiveApp._on_photographer_changed(harness)
+
+    assert cleared == [("", "")]
+
+
+def test_changing_photographer_keeps_url_for_current_search() -> None:
+    cleared: list[tuple[str, str]] = []
+    harness = SimpleNamespace(
+        website_url_var=SimpleNamespace(get=lambda: "https://current.example.test/"),
+        photographer_var=SimpleNamespace(get=lambda: "Current Photographer"),
+        website_url_name="Current Photographer",
+        _set_auto_website_url=lambda url, photographer: cleared.append((url, photographer)),
+    )
+
+    photo_archive_app.PhotoArchiveApp._on_photographer_changed(harness)
+
+    assert cleared == []
+
+
 def test_website_fetch_rejects_oversized_html_before_parsing(monkeypatch) -> None:
     class Response:
         headers = {

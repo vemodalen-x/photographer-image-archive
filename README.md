@@ -62,6 +62,7 @@ python photo_archive_app.py
 The desktop app includes:
 
 - photographer name search
+- local restoration of the last photographer, archive directory, retrieval limits, and gallery/list preference
 - recent-photographer history from the selected local archive
 - automatic official website lookup when the URL field is blank
 - optional manual official website URL scanning
@@ -70,18 +71,18 @@ The desktop app includes:
 - direct research-state filters for high-resolution, downloaded, rated, noted, and unreviewed works
 - a 48-work paged gallery with bounded thumbnail caching for responsive multi-thousand-image archives
 - live result filtering across title, collection, author, caption, source comments, study notes, tags, rating, date, camera, and match reason
-- keyboard navigation between gallery items, Page Up / Page Down result paging, double-click study view, and standard Enter / Escape / F5 commands
+- keyboard navigation between gallery items, Page Up / Page Down result paging, double-click study view, Enter-to-search from the photographer field, and Escape / F5 commands
 - icon command bars, concise tooltips, and right-click record actions
 - collapsible advanced retrieval settings and activity log
 - live search progress with checked / accepted / skipped counts
 - records appear in the table as soon as they are found
 - every accepted record is written to SQLite immediately, before the whole search completes
 - thumbnails load into the result table while the search is still running
-- thumbnail work is capped at four workers and UI event bursts are time-sliced
+- thumbnail work is capped at four workers, UI event bursts are time-sliced, and live gallery refreshes cannot be postponed by a continuous result stream
 - staged progress for identity lookup, site policy, sitemap discovery, page scanning, persistence, and download
 - separate progress counts for confirmed low-resolution files, decorative assets, duplicate URL variants, unknown dimensions, and failed pages
 - elapsed time, issue count, and a Stop action that preserves partial results
-- per-record errors are logged and skipped instead of stopping the whole task
+- per-record errors are logged and skipped instead of stopping the whole task; high-volume activity logs are batched and bounded
 - remote preview for records that are not downloaded yet
 - local preview for downloaded images
 - full-screen study viewer with previous/next navigation and fit/original-size modes

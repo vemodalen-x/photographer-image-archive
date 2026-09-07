@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import queue
 import sys
@@ -45,6 +46,9 @@ THUMB_SIZE = GRID_THUMB_SIZE
 THUMBNAIL_WORKERS = 4
 UI_EVENTS_PER_TICK = 24
 UI_TICK_BUDGET_SECONDS = 0.008
+LOG_FLUSH_DELAY_MS = 90
+MAX_LOG_LINES = 2000
+MAX_PREFERENCES_BYTES = 64 * 1024
 MAX_THUMBNAIL_BYTES = 16 * 1024 * 1024
 MAX_STUDY_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_STUDY_CACHE_BYTES = 128 * 1024 * 1024
@@ -55,6 +59,7 @@ GALLERY_CARD_WIDTH = 252
 GALLERY_CARD_HEIGHT = 220
 GALLERY_GAP = 12
 GALLERY_REFLOW_DELAY_MS = 70
+RESULT_SUMMARY_DELAY_MS = 60
 GALLERY_PAGE_SIZE = 48
 MAX_THUMBNAIL_CACHE_ITEMS = GALLERY_PAGE_SIZE * 3
 RESULT_SCOPE_OPTIONS = (
@@ -66,6 +71,65 @@ RESULT_SCOPE_OPTIONS = (
     ("待研究", "unreviewed"),
 )
 RESULT_SCOPE_CODES = dict(RESULT_SCOPE_OPTIONS)
+PREFERENCES_VERSION = 1
+
+
+def _default_preferences_path() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    base = Path(local_app_data) if local_app_data else Path.home() / ".photographer-image-archive"
+    return base / "PhotographerImageArchive" / "preferences.json" if local_app_data else base / "preferences.json"
+
+
+DEFAULT_PREFERENCES_PATH = _default_preferences_path()
+
+
+def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def _preference_text(payload: dict[str, object], key: str, maximum: int) -> str:
+    value = payload.get(key)
+    return value.strip()[:maximum] if isinstance(value, str) else ""
+
+
+def _load_preferences(path: Path | None) -> dict[str, object]:
+    if path is None:
+        return {}
+    try:
+        if path.stat().st_size > MAX_PREFERENCES_BYTES:
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("version") != PREFERENCES_VERSION:
+        return {}
+
+    preferences: dict[str, object] = {
+        "photographer": _preference_text(payload, "photographer", 240),
+        "website_url": _preference_text(payload, "website_url", 4096),
+        "output_dir": _preference_text(payload, "output_dir", 4096),
+        "limit": _bounded_int(payload.get("limit"), 40, 1, 5000),
+        "download_limit": _bounded_int(payload.get("download_limit"), 12, 0, 5000),
+        "min_edge": _bounded_int(payload.get("min_edge"), DEFAULT_MIN_LONG_EDGE, 0, 10000),
+        "download": payload.get("download") is True,
+        "view_mode": payload.get("view_mode") if payload.get("view_mode") in {"grid", "list"} else "grid",
+        "advanced_visible": payload.get("advanced_visible") is True,
+        "website_is_auto": payload.get("website_is_auto") is True,
+    }
+    return preferences
+
+
+def _write_preferences(path: Path | None, payload: dict[str, object]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 class _DaemonTaskPool:
@@ -516,8 +580,10 @@ class CompareStudyWindow(tk.Toplevel):
 
 
 class PhotoArchiveApp(tk.Tk):
-    def __init__(self, *, load_archive: bool = True) -> None:
+    def __init__(self, *, load_archive: bool = True, preferences_path: Path | None = DEFAULT_PREFERENCES_PATH) -> None:
         super().__init__()
+        self.preferences_path = Path(preferences_path) if preferences_path is not None else None
+        preferences = _load_preferences(self.preferences_path)
         self.title(APP_TITLE)
         self.geometry("1440x920")
         self.minsize(1180, 780)
@@ -563,7 +629,11 @@ class PhotoArchiveApp(tk.Tk):
         self.gallery_page_index = 0
         self.selected_source_key = ""
         self.gallery_reflow_after: str | None = None
+        self.result_summary_after: str | None = None
         self.filter_after: str | None = None
+        self.log_flush_after: str | None = None
+        self.pending_log_lines: list[str] = []
+        self.rendered_log_lines = 0
         self.advanced_visible = False
         self.log_visible = False
         self.compare_source_keys: list[str] = []
@@ -574,16 +644,22 @@ class PhotoArchiveApp(tk.Tk):
         self.study_cache_lock = threading.Lock()
         self.study_executor = _DaemonTaskPool(max_workers=3, thread_name_prefix="photo-study")
 
-        self.photographer_var = tk.StringVar(value="Michael Christopher Brown")
-        self.website_url_var = tk.StringVar(value="")
+        photographer = str(preferences.get("photographer") or "Michael Christopher Brown")
+        website_url = str(preferences.get("website_url") or "")
+        self.website_url_name = photographer if website_url else ""
+        self.photographer_var = tk.StringVar(value=photographer)
+        self.website_url_var = tk.StringVar(value=website_url)
+        if website_url and preferences.get("website_is_auto"):
+            self.auto_website_url = website_url
+            self.auto_website_name = photographer
         self.photographer_var.trace_add("write", self._on_photographer_changed)
         self.website_url_var.trace_add("write", self._on_website_url_changed)
-        self.output_dir_var = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
-        self.limit_var = tk.IntVar(value=40)
-        self.download_limit_var = tk.IntVar(value=12)
-        self.min_edge_var = tk.IntVar(value=DEFAULT_MIN_LONG_EDGE)
-        self.download_var = tk.BooleanVar(value=False)
-        self.view_mode_var = tk.StringVar(value="grid")
+        self.output_dir_var = tk.StringVar(value=str(preferences.get("output_dir") or DEFAULT_OUTPUT_DIR))
+        self.limit_var = tk.IntVar(value=int(preferences.get("limit", 40)))
+        self.download_limit_var = tk.IntVar(value=int(preferences.get("download_limit", 12)))
+        self.min_edge_var = tk.IntVar(value=int(preferences.get("min_edge", DEFAULT_MIN_LONG_EDGE)))
+        self.download_var = tk.BooleanVar(value=bool(preferences.get("download", False)))
+        self.view_mode_var = tk.StringVar(value=str(preferences.get("view_mode") or "grid"))
         self.result_filter_var = tk.StringVar(value="")
         self.result_scope_var = tk.StringVar(value=RESULT_SCOPE_OPTIONS[0][0])
         self.result_count_var = tk.StringVar(value="0 项")
@@ -601,9 +677,12 @@ class PhotoArchiveApp(tk.Tk):
 
         self._configure_style()
         self._build_ui()
+        if preferences.get("advanced_visible"):
+            self._toggle_advanced()
+        self._set_view_mode(self.view_mode_var.get())
         self.result_filter_var.trace_add("write", self._schedule_result_filter)
         self.result_scope_var.trace_add("write", self._schedule_result_filter)
-        self.bind("<Return>", lambda _event: self._start_archive())
+        self.photographer_entry.bind("<Return>", self._submit_search_from_keyboard, add="+")
         self.bind("<Escape>", lambda _event: self._cancel_archive())
         self.bind("<F5>", lambda _event: self._load_existing_records())
         self.bind("<Control-f>", lambda _event: self.result_filter_entry.focus_set())
@@ -618,16 +697,13 @@ class PhotoArchiveApp(tk.Tk):
             self._load_existing_records()
 
     def report_callback_exception(self, exc_type, exc_value, exc_traceback) -> None:
-        """Keep the application running when a UI callback fails."""
+        """Keep the application responsive and expose callback failures non-modally."""
 
         detail = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback)).strip()
         self._add_issue()
         self._log(f"unexpected UI error: {detail}")
-        messagebox.showerror(
-            "操作未完成",
-            f"本次操作发生错误，其他资料与当前任务已保留。\n\n{exc_value}",
-            parent=self,
-        )
+        self.phase_var.set("操作未完成")
+        self.detail_var.set(f"{exc_value}；其他资料与当前任务已保留，详情见活动日志。")
 
     def _configure_style(self) -> None:
         self.configure(bg="#F2F4F5")
@@ -1078,6 +1154,47 @@ class PhotoArchiveApp(tk.Tk):
         except tk.TclError:
             return
 
+    def _submit_search_from_keyboard(self, _event: tk.Event) -> str:
+        self._start_archive()
+        return "break"
+
+    def _preferences_payload(self) -> dict[str, object]:
+        try:
+            limit = int(self.limit_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            limit = 40
+        try:
+            download_limit = int(self.download_limit_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            download_limit = 12
+        try:
+            min_edge = int(self.min_edge_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            min_edge = DEFAULT_MIN_LONG_EDGE
+        website_url = self.website_url_var.get().strip()
+        return {
+            "version": PREFERENCES_VERSION,
+            "photographer": self.photographer_var.get().strip(),
+            "website_url": website_url,
+            "website_is_auto": bool(
+                website_url and website_url == self.auto_website_url and self.photographer_var.get().strip() == self.auto_website_name
+            ),
+            "output_dir": self.output_dir_var.get().strip(),
+            "limit": _bounded_int(limit, 40, 1, 5000),
+            "download_limit": _bounded_int(download_limit, 12, 0, 5000),
+            "min_edge": _bounded_int(min_edge, DEFAULT_MIN_LONG_EDGE, 0, 10000),
+            "download": bool(self.download_var.get()),
+            "view_mode": self.view_mode_var.get() if self.view_mode_var.get() in {"grid", "list"} else "grid",
+            "advanced_visible": self.advanced_visible,
+        }
+
+    def _save_preferences(self) -> None:
+        try:
+            _write_preferences(self.preferences_path, self._preferences_payload())
+        except OSError as exc:
+            self._add_issue()
+            self._log(f"preferences save error: {exc}")
+
     def _toggle_advanced(self) -> None:
         self.advanced_visible = not self.advanced_visible
         if self.advanced_visible:
@@ -1090,6 +1207,10 @@ class PhotoArchiveApp(tk.Tk):
     def _toggle_log(self) -> None:
         self.log_visible = not self.log_visible
         if self.log_visible:
+            if self.log_flush_after is not None:
+                self.after_cancel(self.log_flush_after)
+                self.log_flush_after = None
+            self._flush_log_lines()
             self.log_panel.grid()
             self.log_toggle_button.configure(text="收起日志")
             self.log_text.see(tk.END)
@@ -1153,8 +1274,8 @@ class PhotoArchiveApp(tk.Tk):
         elif self.records and not visible_keys:
             self._clear_record_selection("当前筛选无结果")
         self._schedule_gallery_reflow()
-        self._update_result_count()
-        self._set_gallery_empty_state()
+        self._update_result_count(visible_keys)
+        self._set_gallery_empty_state(visible_keys)
         if self.view_mode_var.get() == "list":
             self.after_idle(self._load_visible_tree_thumbnails)
 
@@ -1217,9 +1338,20 @@ class PhotoArchiveApp(tk.Tk):
         self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all"))
 
     def _schedule_gallery_reflow(self) -> None:
-        if self.gallery_reflow_after:
-            self.after_cancel(self.gallery_reflow_after)
+        if self.gallery_reflow_after is not None:
+            return
         self.gallery_reflow_after = self.after(GALLERY_REFLOW_DELAY_MS, self._reflow_gallery)
+
+    def _schedule_result_summary_refresh(self) -> None:
+        if self.result_summary_after is not None:
+            return
+        self.result_summary_after = self.after(RESULT_SUMMARY_DELAY_MS, self._refresh_result_summary)
+
+    def _refresh_result_summary(self) -> None:
+        self.result_summary_after = None
+        visible_keys = self._visible_source_keys()
+        self._update_result_count(visible_keys)
+        self._set_gallery_empty_state(visible_keys)
 
     def _reflow_gallery(self) -> None:
         """Lay out only visible cards after resize/filter bursts settle.
@@ -1469,21 +1601,28 @@ class PhotoArchiveApp(tk.Tk):
         self._select_gallery_record(target)
         return "break"
 
-    def _update_result_count(self) -> None:
+    def _update_result_count(self, visible_keys: list[str] | None = None) -> None:
         total = len(self.records)
-        visible = len(self._visible_source_keys())
+        visible_keys = self._visible_source_keys() if visible_keys is None else visible_keys
+        visible = len(visible_keys)
         self.result_count_var.set(f"{visible}/{total} 项" if visible != total else f"{total} 项")
-        self._update_gallery_pager(visible)
+        _page_keys, self.gallery_page_index, page_count = _gallery_page_window(visible_keys, self.gallery_page_index)
+        self._update_gallery_pager(visible, page_count)
 
-    def _set_gallery_empty_state(self) -> None:
+    def _set_gallery_empty_state(self, visible_keys: list[str] | None = None) -> None:
         if self.view_mode_var.get() != "grid":
             self.gallery_empty.place_forget()
             return
-        visible = self._visible_source_keys()
-        if visible:
+        visible_keys = self._visible_source_keys() if visible_keys is None else visible_keys
+        if visible_keys:
             self.gallery_empty.place_forget()
             return
-        text = "没有符合当前筛选的作品" if self.records else "当前摄影师尚无已验证作品"
+        if self.records:
+            text = "没有符合当前筛选的作品\n请调整关键词或筛选范围"
+        elif self.busy:
+            text = "正在查找作品\n首个匹配结果会自动出现在这里"
+        else:
+            text = "当前摄影师尚无已验证作品\n点击“检索作品”建立准确索引"
         self.gallery_empty.configure(text=text)
         self.gallery_empty.place(relx=0.5, rely=0.42, anchor=tk.CENTER)
 
@@ -1494,11 +1633,10 @@ class PhotoArchiveApp(tk.Tk):
             self._load_existing_records()
 
     def _on_photographer_changed(self, *_args: object) -> None:
-        if not self.auto_website_url:
+        website_url = self.website_url_var.get().strip()
+        if not website_url:
             return
-        if self.website_url_var.get().strip() != self.auto_website_url:
-            return
-        if self.photographer_var.get().strip() == self.auto_website_name:
+        if self.photographer_var.get().strip() == self.website_url_name:
             return
         self._set_auto_website_url("", "")
 
@@ -1508,10 +1646,12 @@ class PhotoArchiveApp(tk.Tk):
         if self.website_url_var.get().strip() != self.auto_website_url:
             self.auto_website_url = ""
             self.auto_website_name = ""
+        self.website_url_name = self.photographer_var.get().strip() if self.website_url_var.get().strip() else ""
 
     def _set_auto_website_url(self, url: str, photographer: str) -> None:
         self.auto_website_url = url.strip()
         self.auto_website_name = photographer.strip() if self.auto_website_url else ""
+        self.website_url_name = self.auto_website_name
         self._suppress_website_trace = True
         try:
             self.website_url_var.set(self.auto_website_url)
@@ -1537,21 +1677,30 @@ class PhotoArchiveApp(tk.Tk):
             messagebox.showwarning("缺少摄影师", "请先输入摄影师名字。")
             return
         website_url = self.website_url_var.get().strip()
-        if website_url == self.auto_website_url and self.auto_website_name and self.auto_website_name != photographer:
+        if website_url and self.website_url_name != photographer:
             website_url = ""
             self._set_auto_website_url("", "")
-        output_dir = Path(self.output_dir_var.get())
-        limit = int(self.limit_var.get())
-        download_limit = int(self.download_limit_var.get())
-        min_edge = int(self.min_edge_var.get())
+        output_dir_text = self.output_dir_var.get().strip()
+        if not output_dir_text:
+            messagebox.showwarning("缺少归档目录", "请先选择归档目录。")
+            return
+        try:
+            limit = int(self.limit_var.get())
+            download_limit = int(self.download_limit_var.get())
+            min_edge = int(self.min_edge_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            messagebox.showwarning("检索设置无效", "收录、下载和图片尺寸必须是整数。")
+            return
+        if not 1 <= limit <= 5000 or not 0 <= download_limit <= 5000 or not 0 <= min_edge <= 10000:
+            messagebox.showwarning("检索设置无效", "请检查收录、下载和最短长边的数值范围。")
+            return
+        output_dir = Path(output_dir_text).expanduser()
         download = self.download_var.get()
-        self._clear_live_results()
         self.loaded_search_name = photographer
-        self.loaded_database_path = str((output_dir.expanduser() / "photo_archive.db").resolve())
+        self.loaded_database_path = str((output_dir / "photo_archive.db").resolve())
         self.active_photographer = photographer
         self.cancel_event = threading.Event()
         self.issue_count = 0
-        self.issue_var.set("问题 0")
         self.search_started_at = time.perf_counter()
         self._set_busy(True)
         self.phase_var.set("正在检索")
@@ -1562,6 +1711,9 @@ class PhotoArchiveApp(tk.Tk):
         self._set_progress(5)
         self._start_indeterminate_progress()
         self._log(f"search started: {photographer}")
+        self.update_idletasks()
+        self._clear_live_results()
+        self._save_preferences()
         self.worker_thread = threading.Thread(
             target=self._archive_worker,
             args=(photographer, output_dir, website_url, limit, download_limit, min_edge, download),
@@ -1871,12 +2023,14 @@ class PhotoArchiveApp(tk.Tk):
             self.phase_var.set("下载完成")
             self.detail_var.set(f"成功 {payload.get('downloaded')}，失败 {payload.get('failed')}。")
             self._set_progress(100)
+            self._schedule_result_summary_refresh()
         elif event == "cancelled":
             self._set_busy(False)
             self._stop_indeterminate_progress()
             self.phase_var.set("已停止")
             self.detail_var.set(f"已保留 {len(self.records)} 条结果；可以继续浏览或重新检索。")
             self._set_progress(min(95, float(self.progress["value"])))
+            self._schedule_result_summary_refresh()
         elif event == "done":
             summary = payload["summary"]
             self._set_busy(False)
@@ -1885,6 +2039,7 @@ class PhotoArchiveApp(tk.Tk):
             self.detail_var.set(f"收录 {summary.saved} 条，下载 {summary.downloaded} 张，精确重复 {summary.exact_duplicates}，近似重复 {summary.near_duplicates}。")
             self._set_progress(100)
             self.downloaded_var.set(f"下载 {sum(1 for item in self.records.values() if item.local_path)}")
+            self._schedule_result_summary_refresh()
         elif event == "error":
             self._set_busy(False)
             self._stop_indeterminate_progress()
@@ -1892,6 +2047,7 @@ class PhotoArchiveApp(tk.Tk):
             self.detail_var.set(str(payload.get("message", "")))
             self._add_issue()
             self._log("error: " + str(payload.get("message", "")))
+            self._schedule_result_summary_refresh()
 
     def _update_search_progress(self, payload: dict) -> None:
         accepted = int(payload.get("accepted") or len(self.records))
@@ -2022,9 +2178,9 @@ class PhotoArchiveApp(tk.Tk):
         self._set_gallery_empty_state()
 
     def _clear_tree(self) -> None:
-        for item in list(self.records):
-            if self.record_tree.exists(item):
-                self.record_tree.delete(item)
+        existing_items = tuple(self.records)
+        if existing_items:
+            self.record_tree.delete(*existing_items)
         for source_key in list(self.gallery_cards):
             self._destroy_gallery_card(source_key)
         self.records = {}
@@ -2066,8 +2222,7 @@ class PhotoArchiveApp(tk.Tk):
             self._sync_tree_record_visibility(iid, record)
             if not defer_ui:
                 self._schedule_gallery_reflow()
-                self._update_result_count()
-                self._set_gallery_empty_state()
+                self._schedule_result_summary_refresh()
             if select_if_first and len(self.records) == 1:
                 self.record_tree.selection_set(iid)
                 self.record_tree.focus(iid)
@@ -2088,7 +2243,7 @@ class PhotoArchiveApp(tk.Tk):
         self._sync_tree_record_visibility(existing_iid, record)
         if not defer_ui:
             self._schedule_gallery_reflow()
-            self._update_result_count()
+            self._schedule_result_summary_refresh()
 
     def _iid_for_record(self, record: PhotoRecord) -> str | None:
         return self.record_iids.get(record.source_key)
@@ -2657,6 +2812,7 @@ class PhotoArchiveApp(tk.Tk):
     def _on_close(self) -> None:
         if self.closing:
             return
+        self._save_preferences()
         self.closing = True
         self.cancel_event.set()
         self.shutdown_event.set()
@@ -2691,8 +2847,26 @@ class PhotoArchiveApp(tk.Tk):
     def _log(self, message: str) -> None:
         if not message:
             return
-        self.log_text.insert(tk.END, f"{time.strftime('%H:%M:%S')} {message}\n")
-        self.log_text.see(tk.END)
+        self.pending_log_lines.append(f"{time.strftime('%H:%M:%S')} {message}\n")
+        if len(self.pending_log_lines) > MAX_LOG_LINES:
+            del self.pending_log_lines[: len(self.pending_log_lines) - MAX_LOG_LINES]
+        if self.log_flush_after is None:
+            self.log_flush_after = self.after(LOG_FLUSH_DELAY_MS, self._flush_log_lines)
+
+    def _flush_log_lines(self) -> None:
+        self.log_flush_after = None
+        if not self.pending_log_lines:
+            return
+        lines = self.pending_log_lines
+        self.pending_log_lines = []
+        excess = max(0, self.rendered_log_lines + len(lines) - MAX_LOG_LINES)
+        if excess:
+            self.log_text.delete("1.0", f"{excess + 1}.0")
+            self.rendered_log_lines = max(0, self.rendered_log_lines - excess)
+        self.log_text.insert(tk.END, "".join(lines))
+        self.rendered_log_lines += len(lines)
+        if self.log_visible:
+            self.log_text.see(tk.END)
 
 
 def _join(*values: str) -> str:
@@ -2716,7 +2890,7 @@ def main(argv: list[str] | None = None) -> int:
     if args == ["--version"]:
         return 0
     if args == ["--ui-smoke"]:
-        app = PhotoArchiveApp(load_archive=False)
+        app = PhotoArchiveApp(load_archive=False, preferences_path=None)
         probe = threading.Thread(
             target=lambda: app.shutdown_event.wait(5),
             name="photo-archive-ui-smoke-worker",
